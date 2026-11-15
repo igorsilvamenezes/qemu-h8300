@@ -317,6 +317,9 @@ turnstile_passage(const char *desc, uint32_t count) "'%s' passage #%u"
 # battery_sensor.c
 battery_sensor_level(const char *desc, uint32_t mv, uint32_t threshold_mv, const char *state) "'%s' %u mV (threshold %u mV): %s"
 
+# push_button.c
+push_button_state(const char *desc, const char *state, const char *how, uint32_t count) "'%s' %s (%s), %u presses"
+
 # led.c
 led_set_intensity(const char *color, const char *desc, uint8_t intensity_percent) "LED desc:'%s' color:%s intensity: %u%%"
 led_change_intensity(const char *color, const char *desc, uint8_t old_intensity_percent, uint8_t new_intensity_percent) "LED desc:'%s' color:%s intensity %u%% -> %u%%"

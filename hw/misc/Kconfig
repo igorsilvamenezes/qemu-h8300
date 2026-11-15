@@ -155,6 +155,9 @@ config TURNSTILE
 config BATTERY_SENSOR
     bool
 
+config PUSH_BUTTON
+    bool
+
 config MAC_VIA
     bool
     select MOS6522
