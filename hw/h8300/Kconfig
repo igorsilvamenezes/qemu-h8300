@@ -36,4 +36,5 @@ config H8300_E2300
     select HDSP211X
     select MIFARE_MCM
     select SC28C94
+    select RFM433
     select RENESAS_SCI

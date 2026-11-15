@@ -19,6 +19,7 @@
 #include "cpu.h"
 #include "hw/boards.h"
 #include "hw/char/renesas_sci.h"
+#include "hw/char/rfm433.h"
 #include "hw/display/hdsp211x.h"
 #include "hw/misc/mifare_mcm.h"
 #include "hw/char/sc28c94.h"
@@ -89,6 +90,7 @@ struct E2300MachineState {
     bool i2c_sda_line;      /* SDA as seen on the wire, with the slave */
     uint8_t syscr;
     bool autoboot;
+    bool radio;
     QEMUTimer *wdt_timer;
     int64_t wdt_start;
     uint8_t tcsr, tcnt, rstcsr;
@@ -516,14 +518,14 @@ static void e2300_load_flash(E2300MachineState *s, const char *filename)
 }
 
 static void e2300_init_sci(E2300MachineState *s, RSCIState *sci,
-                           const char *name, int serial, hwaddr base, int vec)
+                           const char *name, Chardev *chr, hwaddr base, int vec)
 {
     SysBusDevice *sbd;
     int i;
 
     object_initialize_child(OBJECT(s), name, sci, TYPE_RENESAS_SCI);
     sbd = SYS_BUS_DEVICE(sci);
-    qdev_prop_set_chr(DEVICE(sci), "chardev", serial_hd(serial));
+    qdev_prop_set_chr(DEVICE(sci), "chardev", chr);
     qdev_prop_set_uint64(DEVICE(sci), "input-freq", E2300_CLOCK_HZ);
     qdev_prop_set_uint32(DEVICE(sci), "rev", 0);
     qdev_prop_set_bit(DEVICE(sci), "level-irq", true);
@@ -542,6 +544,7 @@ static void e2300_init(MachineState *machine)
     Object *owner = OBJECT(machine);
     DeviceState *onchip;
     qemu_irq *tpc;
+    Chardev *chr;
     int i;
 
     if (machine->ram_size != 512 * KiB && machine->ram_size != 1 * MiB) {
@@ -630,9 +633,21 @@ static void e2300_init(MachineState *machine)
     }
     s->wovi = qdev_get_gpio_in(onchip, H83003_VEC_WOVI);
 
-    /* SCI1 is the boot monitor port (-serial #0); SCI0 is -serial #1. */
-    e2300_init_sci(s, &s->sci1, "sci1", 0, H83003_SCI1_BASE, H83003_VEC_SCI1);
-    e2300_init_sci(s, &s->sci0, "sci0", 1, H83003_SCI0_BASE, H83003_VEC_SCI0);
+    /*
+     * SCI1 is the boot monitor port and the radio port (-serial #0); SCI0
+     * is -serial #1.  The application drives an RFM433-LC radio modem on
+     * SCI1 ("+++", ATS200=n, ATO).  With radio=on (the default) the modem
+     * sits between SCI1 and -serial #0, which then is the radio side: in
+     * transparent mode, the modem's power-on state, data passes unchanged,
+     * so the boot monitor still works.  -trace "rfm433*" shows the modem.
+     */
+    chr = serial_hd(0);
+    if (s->radio) {
+        chr = rfm433_new("e2300.radio", chr, &error_fatal);
+    }
+    e2300_init_sci(s, &s->sci1, "sci1", chr, H83003_SCI1_BASE, H83003_VEC_SCI1);
+    e2300_init_sci(s, &s->sci0, "sci0", serial_hd(1), H83003_SCI0_BASE,
+                   H83003_VEC_SCI0);
 }
 
 static bool e2300_get_autoboot(Object *obj, Error **errp)
@@ -643,6 +658,21 @@ static bool e2300_get_autoboot(Object *obj, Error **errp)
 static void e2300_set_autoboot(Object *obj, bool enabled, Error **errp)
 {
     E2300_MACHINE(obj)->autoboot = enabled;
+}
+
+static bool e2300_get_radio(Object *obj, Error **errp)
+{
+    return E2300_MACHINE(obj)->radio;
+}
+
+static void e2300_set_radio(Object *obj, bool enabled, Error **errp)
+{
+    E2300_MACHINE(obj)->radio = enabled;
+}
+
+static void e2300_instance_init(Object *obj)
+{
+    E2300_MACHINE(obj)->radio = true;
 }
 
 static void e2300_class_init(ObjectClass *oc, void *data)
@@ -660,12 +690,17 @@ static void e2300_class_init(ObjectClass *oc, void *data)
                                    e2300_get_autoboot, e2300_set_autoboot);
     object_class_property_set_description(oc, "autoboot",
                                           "Set boot switches for OS startup");
+    object_class_property_add_bool(oc, "radio",
+                                   e2300_get_radio, e2300_set_radio);
+    object_class_property_set_description(oc, "radio",
+                                          "RFM433-LC radio modem on SCI1");
 }
 
 static const TypeInfo e2300_type = {
     .name = TYPE_E2300_MACHINE,
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(E2300MachineState),
+    .instance_init = e2300_instance_init,
     .class_init = e2300_class_init,
 };
 

@@ -118,3 +118,8 @@ xen_console_device_destroy(unsigned int idx) "idx %u"
 sc28c94_read(uint64_t addr, uint8_t val) "addr 0x%02" PRIx64 " val 0x%02x"
 sc28c94_write(uint64_t addr, uint64_t val) "addr 0x%02" PRIx64 " val 0x%02" PRIx64
 sc28c94_tx(int channel, uint8_t val) "channel %d val 0x%02x"
+
+# rfm433.c
+rfm433_mode(const char *mode) "%s"
+rfm433_command(const char *cmd, const char *result) "AT%s -> %s"
+rfm433_channel(unsigned channel) "channel %u"
