@@ -25,6 +25,7 @@
 #include "hw/misc/gpio_beeper.h"
 #include "hw/misc/led.h"
 #include "hw/misc/mifare_mcm.h"
+#include "hw/misc/turnstile.h"
 #include "hw/char/sc28c94.h"
 #include "hw/h8300/h83003_onchip.h"
 #include "hw/i2c/bitbang_i2c.h"
@@ -94,6 +95,20 @@ enum {
 #define E2300_IC2_SWITCHES 4
 #define E2300_IC2_ALL_ON 0xf
 
+/*
+ * Turnstile, driven by the OS gate() and checkgate() calls.  gate() sets
+ * P4.7 to energize the release solenoid (the application passes
+ * turnstile_open_status, 1 by default, so high releases the arm).
+ * checkgate() returns the rotation switches as read, 1 = closed: on this
+ * board (OS hardware variant 4) switch 1 is P6.2 and switch 2 is P6.1;
+ * variant 2 boards read switch 1 on P6.0, so it is mirrored there.  The
+ * application waits for switch 1, drops the solenoid and waits for switch
+ * 2 to end the passage.  Both switches are open with the arm at rest.
+ */
+#define E2300_GATE_SOLENOID 0x80     /* P4.7 */
+#define E2300_GATE_SW1 0x05          /* P6.2, and P6.0 for variant 2 */
+#define E2300_GATE_SW2 0x02          /* P6.1 */
+
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
     FLASH_ARRAY, FLASH_ID, FLASH_STATUS, FLASH_PROGRAM, FLASH_ERASE,
@@ -111,6 +126,9 @@ struct E2300MachineState {
     qemu_irq wovi;
     qemu_irq panel[E2300_PANEL_LINES];  /* P4.0-P4.3 */
     uint8_t panel_level;
+    TurnstileState *turnstile;
+    qemu_irq gate;                      /* P4.7, release solenoid */
+    uint8_t gate_switches;              /* TURNSTILE_SW1/SW2 bits, 1 = closed */
     MemoryRegion flash;
     MemoryRegion absent;
     MemoryRegion iram;
@@ -129,6 +147,7 @@ struct E2300MachineState {
     uint8_t syscr;
     bool autoboot;
     bool radio;
+    bool has_turnstile;
     char *switches;         /* "switches" machine property */
     DIPSwitchState *ic2;
     int ic2_traced;         /* positions last reported, -1 for none */
@@ -310,7 +329,10 @@ static void e2300_i2c_update(E2300MachineState *s)
     }
 }
 
-/* Drive the front panel LEDs and beeper from the P4 output pins. */
+/*
+ * Drive the front panel LEDs and beeper, and the turnstile solenoid, from
+ * the P4 output pins.
+ */
 static void e2300_panel_update(E2300MachineState *s, bool force)
 {
     uint8_t level = s->port[PORT_REG(0xffffc7)] & s->port[PORT_REG(0xffffc5)];
@@ -323,6 +345,17 @@ static void e2300_panel_update(E2300MachineState *s, bool force)
             qemu_set_irq(s->panel[i], extract32(level, i, 1));
         }
     }
+    if (changed & E2300_GATE_SOLENOID) {
+        qemu_set_irq(s->gate, !!(level & E2300_GATE_SOLENOID));
+    }
+}
+
+/* A turnstile rotation switch opened or closed. */
+static void e2300_gate_switch(void *opaque, int n, int level)
+{
+    E2300MachineState *s = opaque;
+
+    s->gate_switches = deposit32(s->gate_switches, n, 1, level != 0);
 }
 
 /* Level of the pins configured as inputs. */
@@ -336,6 +369,19 @@ static uint8_t port_pins(E2300MachineState *s, hwaddr reg)
         return ~dip_switch_get(s->ic2) & 0xe;
     case 0xffffd7: /* PCDR bit 4, IC2 switch 1 */
         return (~dip_switch_get(s->ic2) & 0x1) << 4;
+    case 0xffffcb: /* P6DR bits 0-2, turnstile switches */
+        if (s->turnstile) {
+            uint8_t pins = ~(E2300_GATE_SW1 | E2300_GATE_SW2);
+
+            if (s->gate_switches & BIT(TURNSTILE_SW1)) {
+                pins |= E2300_GATE_SW1;
+            }
+            if (s->gate_switches & BIT(TURNSTILE_SW2)) {
+                pins |= E2300_GATE_SW2;
+            }
+            return pins;
+        }
+        return 0xff;
     default:       /* undriven inputs are pulled up */
         return 0xff;
     }
@@ -571,6 +617,7 @@ static void e2300_reset(MachineState *machine, ShutdownCause reason)
     s->tcnt = 0;
     s->rstcsr = s->wdt_reset_pending ? 0xbf : 0x3f;
     s->wdt_reset_pending = false;
+    s->gate_switches = 0;
 
     qemu_devices_reset(reason);
     /* The LED devices reset to "on"; show the pins, all low after reset. */
@@ -780,6 +827,25 @@ static void e2300_init(MachineState *machine)
         gpio_beeper_create_simple(OBJECT(machine), "beeper", "beep")), 0);
 
     /*
+     * Turnstile on P4.7 (solenoid) and P6 (switches), unless turnstile=off,
+     * which leaves P6 pulled up: checkgate() then reports a completed
+     * rotation at once.  A passenger passes one second after each release;
+     * -global turnstile.auto=off disables that, "qom-set /machine/gate
+     * push on" pushes the arm and "qom-get /machine/gate passages"
+     * counts them.  -trace "turnstile*" shows the solenoid and switches.
+     */
+    if (s->has_turnstile) {
+        s->turnstile = turnstile_create_simple(OBJECT(machine), "gate",
+                                               "gate");
+        s->gate = qdev_get_gpio_in(DEVICE(s->turnstile), 0);
+        for (i = 0; i < TURNSTILE_SWITCHES; i++) {
+            qdev_connect_gpio_out_named(DEVICE(s->turnstile), "switch", i,
+                                        qemu_allocate_irq(e2300_gate_switch,
+                                                          s, i));
+        }
+    }
+
+    /*
      * Proximity card reader.  Give it a card with
      * -global mifare-mcm.card=card.bin, or place a blank one with
      * -global mifare-mcm.present=on; "qom-set /machine/mifare present ..."
@@ -871,9 +937,20 @@ static void e2300_set_radio(Object *obj, bool enabled, Error **errp)
     E2300_MACHINE(obj)->radio = enabled;
 }
 
+static bool e2300_get_turnstile(Object *obj, Error **errp)
+{
+    return E2300_MACHINE(obj)->has_turnstile;
+}
+
+static void e2300_set_turnstile(Object *obj, bool enabled, Error **errp)
+{
+    E2300_MACHINE(obj)->has_turnstile = enabled;
+}
+
 static void e2300_instance_init(Object *obj)
 {
     E2300_MACHINE(obj)->radio = true;
+    E2300_MACHINE(obj)->has_turnstile = true;
     E2300_MACHINE(obj)->ic2_traced = -1;
 }
 
@@ -907,6 +984,11 @@ static void e2300_class_init(ObjectClass *oc, void *data)
                                    e2300_get_radio, e2300_set_radio);
     object_class_property_set_description(oc, "radio",
                                           "RFM433-LC radio modem on SCI1");
+    object_class_property_add_bool(oc, "turnstile",
+                                   e2300_get_turnstile, e2300_set_turnstile);
+    object_class_property_set_description(oc, "turnstile",
+        "Turnstile on P4.7 (solenoid) and P6 (switches); "
+        "off leaves P6 pulled up");
 }
 
 static const TypeInfo e2300_type = {

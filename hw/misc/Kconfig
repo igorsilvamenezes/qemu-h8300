@@ -149,6 +149,9 @@ config DIP_SWITCH
 config GPIO_BEEPER
     bool
 
+config TURNSTILE
+    bool
+
 config MAC_VIA
     bool
     select MOS6522
