@@ -100,6 +100,31 @@ enum {
 #define E2300_IC2_ALL_ON 0xf
 
 /*
+ * IC24, four DIP switches used only to replace the boot program.  The
+ * production test specification of the BD2300 says they must be set with
+ * switches 1 and 2 ON and 3 and 4 OFF in normal operation; SENDBIN /Z1
+ * then asks for 1 and 2 OFF, 3 and 4 ON before SENDBIN /Z2, and for the
+ * original setting afterwards.  The boot's Z1 erases the flash block that
+ * holds 0x10000 and programs the new boot at 0x10000-0x13FFF; Z2 copies
+ * the boot it is running from (0x0000-0x3FFF) to 0x10000 the same way.
+ * Nothing in the boot writes below 0x4000, so the procedure only replaces
+ * the boot block if the second setting swaps CPU 0x0000 and 0x10000 for
+ * the flash: the model inverts flash address line A16 [inferred from the
+ * boot code and SENDBIN; the board schematic is not available].  In the
+ * swapped setting the CPU starts the new boot from the physical 0x10000,
+ * and Z2 erases and programs the physical boot block 0x0000-0x3FFF.
+ *
+ * Any other setting does not select a known A16 source (the line would
+ * be floating or driven both ways); the model logs a guest error and
+ * keeps A16 straight.
+ */
+#define E2300_IC24_SWITCHES 4
+#define E2300_IC24_NORMAL 0x3       /* 1 and 2 ON, 3 and 4 OFF */
+#define E2300_IC24_BOOT_SWAP 0xc    /* 1 and 2 OFF, 3 and 4 ON */
+#define E2300_FLASH_A16 0x10000
+#define E2300_FLASH_BANKS (E2300_FLASH_SIZE / E2300_FLASH_A16)
+
+/*
  * Turnstile, driven by the OS gate() and checkgate() calls.  gate() sets
  * P4.7 to energize the release solenoid (the application passes
  * turnstile_open_status, 1 by default, so high releases the arm).
@@ -179,6 +204,8 @@ struct E2300MachineState {
     PushButtonState *driver_button;
     bool driver_button_pressed;
     MemoryRegion flash;
+    MemoryRegion flash_swap[E2300_FLASH_BANKS]; /* A16 inverted by IC24 */
+    bool flash_a16_inverted;
     MemoryRegion absent;
     MemoryRegion iram;
     MemoryRegion gpio;
@@ -203,6 +230,9 @@ struct E2300MachineState {
     char *switches;         /* "switches" machine property */
     DIPSwitchState *ic2;
     int ic2_traced;         /* positions last reported, -1 for none */
+    char *ic24_mode;        /* "boot-switches" machine property */
+    DIPSwitchState *ic24;
+    int ic24_traced;        /* positions last applied, -1 for none */
     QEMUTimer *wdt_timer;
     int64_t wdt_start;
     uint8_t tcsr, tcnt, rstcsr;
@@ -490,6 +520,62 @@ static void e2300_switch_changed(void *opaque, int n, int level)
     e2300_switches_trace(opaque);
 }
 
+static const char *e2300_ic24_mode(uint32_t positions)
+{
+    switch (positions) {
+    case E2300_IC24_NORMAL:
+        return "normal, flash A16 straight";
+    case E2300_IC24_BOOT_SWAP:
+        return "boot swap, flash A16 inverted";
+    default:
+        return "undefined, flash A16 kept straight";
+    }
+}
+
+/*
+ * Apply the IC24 positions to the flash address line A16.  The aliases
+ * map each 64 KiB of the CPU's flash window onto the other half of its
+ * 128 KiB pair, above the straight mapping, so reads in array mode,
+ * commands, programming and erasing all reach the flash at the physical
+ * address.  Toggling them changes the memory map, which flushes the TLB
+ * and the jump cache; translated code is looked up by physical address.
+ */
+static void e2300_ic24_update(E2300MachineState *s)
+{
+    uint32_t positions = dip_switch_get(s->ic24);
+    bool inverted = positions == E2300_IC24_BOOT_SWAP;
+    g_autofree char *text = NULL;
+    int i;
+
+    if (s->ic24_traced == positions) {
+        return;
+    }
+    s->ic24_traced = positions;
+    text = dip_switch_format(positions, E2300_IC24_SWITCHES);
+    trace_e2300_ic24(text, positions, e2300_ic24_mode(positions));
+    if (positions != E2300_IC24_NORMAL && !inverted) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "e2300: IC24 %s selects no source for flash A16 "
+                      "(normal on,on,off,off; boot swap off,off,on,on); "
+                      "keeping A16 straight\n", text);
+    }
+    if (inverted == s->flash_a16_inverted) {
+        return;
+    }
+    s->flash_a16_inverted = inverted;
+    memory_region_transaction_begin();
+    for (i = 0; i < E2300_FLASH_BANKS; i++) {
+        memory_region_set_enabled(&s->flash_swap[i], inverted);
+    }
+    memory_region_transaction_commit();
+}
+
+/* An IC24 output changed; the positions are read from the bank. */
+static void e2300_ic24_changed(void *opaque, int n, int level)
+{
+    e2300_ic24_update(opaque);
+}
+
 static uint64_t gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
     E2300MachineState *s = opaque;
@@ -678,6 +764,7 @@ static const MemoryRegionOps wdt_ops = {
 static void e2300_reset_peripherals(E2300MachineState *s)
 {
     device_cold_reset(DEVICE(s->ic2));
+    device_cold_reset(DEVICE(s->ic24));
     device_cold_reset(DEVICE(s->battery));
     device_cold_reset(DEVICE(s->beeper));
     if (s->turnstile) {
@@ -709,8 +796,13 @@ static void e2300_reset(MachineState *machine, ShutdownCause reason)
     /* P4 pins are all low after reset: this re-drives the LEDs too. */
     e2300_panel_update(s, true);
     cpu_reset(CPU(&s->cpu));
-    /* Reset fetches from the live flash, so programming survives reset. */
-    cpu_set_pc(CPU(&s->cpu), ldl_be_p(data) & 0xffffff);
+    /*
+     * Reset fetches from the live flash, so programming survives reset,
+     * through IC24's A16 setting.
+     */
+    cpu_set_pc(CPU(&s->cpu),
+               ldl_be_p(data + (s->flash_a16_inverted ? E2300_FLASH_A16 : 0))
+               & 0xffffff);
 }
 
 static void e2300_load_flash(E2300MachineState *s, const char *filename)
@@ -862,6 +954,49 @@ static void e2300_init_switches(E2300MachineState *s)
     e2300_switches_trace(s);
 }
 
+/* Translate the "boot-switches" presets into dip-switch positions. */
+static const char *e2300_ic24_preset(const char *name)
+{
+    if (!g_ascii_strcasecmp(name, "normal")) {
+        return "on:on:off:off";
+    }
+    if (!g_ascii_strcasecmp(name, "boot-swap") ||
+        !g_ascii_strcasecmp(name, "swap")) {
+        return "off:off:on:on";
+    }
+    return name;
+}
+
+static void e2300_init_ic24(E2300MachineState *s)
+{
+    MemoryRegion *sysmem = get_system_memory();
+    qemu_irq *in;
+    int i;
+
+    for (i = 0; i < E2300_FLASH_BANKS; i++) {
+        g_autofree char *name = g_strdup_printf("e2300.flash-a16-swap%d", i);
+
+        memory_region_init_alias(&s->flash_swap[i], OBJECT(s), name,
+                                 &s->flash, (i ^ 1) * E2300_FLASH_A16,
+                                 E2300_FLASH_A16);
+        memory_region_set_enabled(&s->flash_swap[i], false);
+        memory_region_add_subregion_overlap(sysmem, i * E2300_FLASH_A16,
+                                            &s->flash_swap[i], 1);
+    }
+
+    /* Always set: a -global dip-switch.positions is meant for IC2. */
+    s->ic24 = dip_switch_create_simple(OBJECT(s), "ic24", "IC24",
+                                       E2300_IC24_SWITCHES,
+                                       e2300_ic24_preset(s->ic24_mode ?
+                                                         s->ic24_mode :
+                                                         "normal"));
+    in = qemu_allocate_irqs(e2300_ic24_changed, s, E2300_IC24_SWITCHES);
+    for (i = 0; i < E2300_IC24_SWITCHES; i++) {
+        qdev_connect_gpio_out_named(DEVICE(s->ic24), "switch", i, in[i]);
+    }
+    e2300_ic24_update(s);
+}
+
 static void e2300_init(MachineState *machine)
 {
     E2300MachineState *s = E2300_MACHINE(machine);
@@ -936,6 +1071,17 @@ static void e2300_init(MachineState *machine)
      * run time; -trace e2300_switches (or dip_switch_set) reports them.
      */
     e2300_init_switches(s);
+
+    /*
+     * IC24 boot swap switches, /machine/ic24: boot-switches=normal (the
+     * default), boot-swap or a list such as on:on:off:off.  To change them
+     * as with the unit switched off, run "qom-set /machine boot-switches
+     * boot-swap" (or "qom-set /machine/ic24 positions off:off:on:on") and
+     * then system_reset; the flash keeps its contents over the reset.  A
+     * change at run time takes effect at once.  -trace e2300_ic24
+     * reports them.
+     */
+    e2300_init_ic24(s);
 
     /*
      * Front panel lamps on port 4, one device each so that they show up
@@ -1093,6 +1239,31 @@ static void e2300_set_switches(Object *obj, const char *value, Error **errp)
     s->switches = g_strdup(value);
 }
 
+static char *e2300_get_ic24(Object *obj, Error **errp)
+{
+    E2300MachineState *s = E2300_MACHINE(obj);
+
+    if (s->ic24) {
+        return dip_switch_format(dip_switch_get(s->ic24),
+                                 E2300_IC24_SWITCHES);
+    }
+    return g_strdup(s->ic24_mode ? s->ic24_mode : "normal");
+}
+
+static void e2300_set_ic24(Object *obj, const char *value, Error **errp)
+{
+    E2300MachineState *s = E2300_MACHINE(obj);
+
+    if (s->ic24) {
+        /* At run time, move the switches of the existing bank. */
+        object_property_set_str(OBJECT(s->ic24), "positions",
+                                e2300_ic24_preset(value), errp);
+        return;
+    }
+    g_free(s->ic24_mode);
+    s->ic24_mode = g_strdup(value);
+}
+
 static bool e2300_get_radio(Object *obj, Error **errp)
 {
     return E2300_MACHINE(obj)->radio;
@@ -1145,11 +1316,13 @@ static void e2300_instance_init(Object *obj)
     E2300_MACHINE(obj)->radio = true;
     E2300_MACHINE(obj)->has_turnstile = true;
     E2300_MACHINE(obj)->ic2_traced = -1;
+    E2300_MACHINE(obj)->ic24_traced = -1;
 }
 
 static void e2300_instance_finalize(Object *obj)
 {
     g_free(E2300_MACHINE(obj)->switches);
+    g_free(E2300_MACHINE(obj)->ic24_mode);
     g_free(E2300_MACHINE(obj)->battery_mode);
 }
 
@@ -1174,6 +1347,11 @@ static void e2300_class_init(ObjectClass *oc, void *data)
     object_class_property_set_description(oc, "switches",
         "IC2 DIP switches: monitor, normal, test, debug, a list such as "
         "on:off:off:on (switch 1 first) or a bit mask such as 8");
+    object_class_property_add_str(oc, "boot-switches",
+                                  e2300_get_ic24, e2300_set_ic24);
+    object_class_property_set_description(oc, "boot-switches",
+        "IC24 boot swap DIP switches: normal (on,on,off,off), boot-swap "
+        "(off,off,on,on, flash A16 inverted) or a list or bit mask");
     object_class_property_add_bool(oc, "radio",
                                    e2300_get_radio, e2300_set_radio);
     object_class_property_set_description(oc, "radio",

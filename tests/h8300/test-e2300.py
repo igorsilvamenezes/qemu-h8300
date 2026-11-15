@@ -3,13 +3,17 @@
 
 The caller supplies E2300bt1.bin including its transport checksum. QEMU
 opens it read-only. All writes and resets happen inside the emulated board.
+The boot replacement check drives the IC24 switches through the HMP
+monitor on a UNIX socket in a temporary directory.
 """
 
 import argparse
 import os
 from pathlib import Path
 import select
+import socket
 import subprocess
+import tempfile
 import time
 
 
@@ -90,6 +94,126 @@ def check_monitor(qemu, rom, accel):
             proc.kill()
 
 
+def crc_arc(data):
+    """CRC-16/ARC, the algorithm of the boot's header check and X command."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def new_boot(image):
+    """Copy of the boot with version 16 renamed 99, header CRC and trailer."""
+    boot = bytearray(image[:0x4000])
+    begin = int.from_bytes(boot[0x104:0x108], "big")
+    end = int.from_bytes(boot[0x108:0x10C], "big")
+    if boot[0x10C:0x11C] != b"E2300BT V1.12/16":
+        raise ValueError("Expected E2300BT V1.12/16")
+    boot[0x11A:0x11C] = b"99"
+    boot[0x100:0x102] = crc_arc(boot[begin:end]).to_bytes(2, "big")
+    return bytes(boot) + ((0xFFFF - sum(boot)) & 0xFFFF).to_bytes(2, "big")
+
+
+def swapped_hex(value):
+    """The monitor prints CRCs with their bytes swapped."""
+    return b"%02X%02X" % (value & 0xFF, value >> 8)
+
+
+class Monitor:
+    """Minimal HMP client."""
+
+    def __init__(self, path):
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            try:
+                self.sock = socket.socket(socket.AF_UNIX)
+                self.sock.connect(path)
+                break
+            except OSError:
+                self.sock.close()
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.1)
+        self.sock.settimeout(TIMEOUT)
+        self.read()
+
+    def read(self):
+        data = b""
+        while not data.endswith(b"(qemu) "):
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError(f"QEMU closed the monitor: {data!r}")
+            data += chunk
+        return data
+
+    def command(self, text):
+        self.sock.sendall(text.encode() + b"\n")
+        return self.read()
+
+
+def check_boot_swap(qemu, rom, accel):
+    """Replace the boot with Z1, IC24 boot-swap, Z2 and IC24 normal."""
+    image = rom.read_bytes()
+    boot = new_boot(image)
+    old_crc = swapped_hex(crc_arc(image[0x102:0x2C2E]))
+    new_crc = swapped_hex(crc_arc(boot[0x102:0x2C2E]))
+    upload_crc = swapped_hex(crc_arc(boot[:0x4000]))
+    with tempfile.TemporaryDirectory(prefix="e2300-") as tmp:
+        mon = os.path.join(tmp, "hmp")
+        args = [
+            qemu, "-M", "e2300", "-bios", rom, "-accel", accel,
+            "-display", "none", "-serial", "stdio",
+            "-monitor", f"unix:{mon},server=on,wait=off",
+        ]
+        with subprocess.Popen(args, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, bufsize=0) as proc:
+            try:
+                monitor = Monitor(mon)
+                expect(proc.stdout, PROMPT)
+
+                # Z1 programs the new boot at 0x10000; the running one stays.
+                send(proc.stdin, b"Z1\r")
+                expect(proc.stdout, b"Z1\r\n")
+                send(proc.stdin, boot)
+                expect(proc.stdout, PROMPT, b"N\r\nF " + upload_crc + b"\r\n")
+                send(proc.stdin, b"X 102 2C2E\r")
+                expect(proc.stdout, PROMPT, b"\r\n" + old_crc + b"\r\n")
+
+                # Switches 1 and 2 OFF, 3 and 4 ON: the new boot starts.
+                monitor.command("qom-set /machine boot-switches boot-swap")
+                monitor.command("system_reset")
+                expect(proc.stdout, PROMPT)
+                for command, reply in (
+                    (b"X 102 2C2E\r", b"\r\n" + new_crc + b"\r\n"),
+                    (b"D 11A 11C\r", b"\r\n39 39 "),
+                    (b"D 1011A 1011C\r", b"\r\n31 36 "),
+                    (b"Z2\r", b"\r\nF " + upload_crc + b"\r\n"),
+                    (b"D 1011A 1011C\r", b"\r\n39 39 "),
+                ):
+                    send(proc.stdin, command)
+                    expect(proc.stdout, PROMPT, reply)
+
+                # Original setting: the new boot is now in the boot block.
+                monitor.command("qom-set /machine boot-switches normal")
+                monitor.command("system_reset")
+                expect(proc.stdout, PROMPT)
+                for command, reply in (
+                    (b"X 102 2C2E\r", b"\r\n" + new_crc + b"\r\n"),
+                    (b"D 11A 11C\r", b"\r\n39 39 "),
+                ):
+                    send(proc.stdin, command)
+                    expect(proc.stdout, PROMPT, reply)
+
+                # Undefined positions keep A16 straight.
+                monitor.command("qom-set /machine/ic24 positions on:off:on:off")
+                send(proc.stdin, b"D 11A 11C\r")
+                expect(proc.stdout, PROMPT, b"\r\n39 39 ")
+            finally:
+                proc.kill()
+
+
 def main():
     """Run the serial regression against an existing QEMU executable."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -100,6 +224,8 @@ def main():
     args = parser.parse_args()
     check_monitor(args.qemu.resolve(), args.rom.resolve(), args.accel)
     print(f"PASS: E2300 monitor, flash programming and watchdog ({args.accel})")
+    check_boot_swap(args.qemu.resolve(), args.rom.resolve(), args.accel)
+    print(f"PASS: E2300 boot replacement with IC24 ({args.accel})")
 
 
 if __name__ == "__main__":
