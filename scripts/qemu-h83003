@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Boot H8/3003 example ROMs on KaneBebe and verify optional trace profiles."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+SCRIPTS = Path(__file__).resolve().parent
+DEFAULT_QEMU = SCRIPTS.parent / "build-h8" / "qemu-system-h8300"
+PORT_WRITE = re.compile(
+    r"h83003_portb_write pc=(0x[0-9a-f]+) addr (0x[0-9a-f]+) "
+    r"value (0x[0-9a-f]+) size ([0-9]+)"
+)
+CPU_PC = re.compile(r"pc=(0x[0-9a-f]+) ")
+
+
+def find_profile(rom):
+    """Prefer a profile alongside the ROM or in its project directory."""
+    name = rom.with_suffix(".qemu.json").name
+    candidates = [rom.with_name(name)]
+    if rom.parent.name == "build":
+        project = rom.parent.parent
+        candidates.append(project / name)
+        candidates.append(SCRIPTS / "h83003-profiles" / project.name / name)
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def verify_trace(log, profile):
+    """Check every relevant event in order and keep only running counts."""
+    setup = profile["setup"]
+    cycle = profile.get("cycle", [])
+    flow = profile.get("cpu_flow")
+    min_cycles = profile.get("min_cycles", 0)
+    if type(min_cycles) is not int or min_cycles < 0:
+        raise ValueError("min_cycles must be a nonnegative integer")
+    minimum = len(setup) + len(cycle) * min_cycles
+    if not minimum or (min_cycles and not cycle):
+        raise ValueError("profile must require Port B writes")
+    writes = samples = idle_samples = 0
+
+    with log.open(encoding="utf-8", errors="replace") as trace:
+        for number, line in enumerate(trace, 1):
+            if flow and re.search(r"Invalid (read|write)", line):
+                raise ValueError(f"line {number}: {line.strip()}")
+
+            pc = CPU_PC.match(line)
+            if flow and pc:
+                address = int(pc[1], 16)
+                prefix = flow.get("prefix", [])
+                expected = prefix[samples] if samples < len(prefix) else flow["idle"]
+                if prefix and address != int(expected, 16):
+                    raise ValueError(f"line {number}: PC {pc[1]}, expected {expected}")
+                samples += 1
+                idle_samples += address == int(flow["idle"], 16)
+
+            if not line.startswith("h83003_portb_write "):
+                continue
+            event = PORT_WRITE.fullmatch(line.rstrip("\n"))
+            if not event:
+                raise ValueError(f"line {number}: malformed Port B write")
+
+            if writes < len(setup):
+                expected = setup[writes]
+            elif cycle:
+                expected = cycle[(writes - len(setup)) % len(cycle)]
+            else:
+                raise ValueError(f"line {number}: unexpected extra Port B write")
+
+            actual = tuple(int(field, 0) for field in event.groups())
+            wanted = tuple(int(expected[key], 16) for key in ("pc", "addr", "value"))
+            if actual != (*wanted, expected["size"]):
+                raise ValueError(f"line {number}: {line.strip()}, expected {expected}")
+            if "cpu_samples" in expected and samples != expected["cpu_samples"]:
+                raise ValueError(f"line {number}: write occurred outside expected CPU sample")
+            writes += 1
+
+    if writes < minimum:
+        raise ValueError(f"observed {writes} Port B writes, expected at least {minimum}")
+    if flow and idle_samples < flow["min_idle_samples"]:
+        raise ValueError(f"observed only {idle_samples} idle CPU samples")
+    return writes
+
+
+def main():
+    """Build the emulator command and return a status suitable for Make."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("rom", type=Path, help="raw firmware image")
+    parser.add_argument("--test", action="store_true", help="verify a bounded run")
+    parser.add_argument("--profile", type=Path, help="override automatic profile lookup")
+    parser.add_argument("--qemu", default=str(DEFAULT_QEMU), help="QEMU executable")
+    parser.add_argument("--log", type=Path, help="override the trace output path")
+    args = parser.parse_args()
+
+    profile_path = args.profile or find_profile(args.rom.absolute())
+    log = args.log or args.rom.parent / ("qemu-trace.log" if args.test else "qemu-run.log")
+
+    try:
+        if not args.rom.is_file():
+            raise ValueError(f"ROM not found: {args.rom}")
+        if args.test and profile_path is None:
+            raise ValueError("no test profile found; use --profile")
+        profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path else {}
+        if not isinstance(profile, dict):
+            raise ValueError("profile must contain a JSON object")
+        if log.exists() and (log.samefile(args.rom)
+                             or (profile_path and log.samefile(profile_path))):
+            raise ValueError("trace path points to the ROM or profile")
+        # Keep the trace path absolute so QEMU always opens it as a file.
+        command = [
+            args.qemu, "-M", "KaneBebe,h83003-portb=on",
+            "-bios", str(args.rom.resolve()), "-display", "none",
+            "-serial", "null", "-nic", "none",
+            "-accel", "tcg,one-insn-per-tb=on",
+            "-trace", "enable=h83003_portb_write", "-D", str(log.resolve()),
+            "-monitor", "none" if args.test else "stdio",
+        ]
+        if "icount_shift" in profile:
+            command.extend(["-icount", f"shift={profile['icount_shift']},align=on"])
+
+        if not args.test:
+            print(f"GPIO trace: {log}", flush=True)
+            os.execvp(command[0], command)
+
+        seconds = profile["timeout_seconds"]
+        if type(seconds) is not int or seconds < 1:
+            raise ValueError("timeout_seconds must be a positive integer")
+        if profile.get("cpu_flow"):
+            command.extend(["-d", "cpu,nochain,guest_errors"])
+        # Clear old evidence and require GNU timeout to stop the infinite firmware.
+        log.write_text("", encoding="utf-8")
+        result = subprocess.run(["timeout", "-k", "2", str(seconds), *command], check=False)
+        if result.returncode != 124:
+            raise ValueError(f"QEMU exited with status {result.returncode}, expected timeout")
+        writes = verify_trace(log, profile)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"FAIL: {error}. Trace: {log}", file=sys.stderr)
+        return 1
+
+    print(f"PASS: {writes} Port B writes matched. Trace: {log}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

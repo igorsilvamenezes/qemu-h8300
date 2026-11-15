@@ -1,0 +1,44 @@
+# Running H8/3003 example firmware
+
+Build this fork for `h8300-softmmu` before using the launcher. It uses
+`build-h8/qemu-system-h8300` by default and accepts an alternate executable
+with `--qemu`. The launcher requires Python 3, and automated runs use GNU
+`timeout`.
+
+From a firmware project directory, build the ROM with `make` and run it
+with the launcher on your PATH:
+
+```sh
+qemu-h83003 build/blink.bin
+qemu-h83003 --test build/blink.bin
+```
+
+The first command opens the QEMU monitor. Enter `quit` to stop the run.
+The second stops the emulator at the profile's host timeout and returns
+zero only if the trace satisfies the profile. The default logs are
+`qemu-run.log` and `qemu-trace.log` next to the ROM. Use `--log` to
+override the path. The launcher loads the raw ROM with `-bios` and uses
+KaneBebe with the optional H8/3003 Port B model.
+
+For a ROM named `build/blink.bin`, profile lookup checks
+`build/blink.qemu.json`, then `blink.qemu.json` in the project directory.
+As a fallback, the launcher checks this directory under the project
+directory's name. Use `--profile FILE` to select a profile explicitly.
+Interactive runs can boot without a profile.
+
+- `timeout_seconds` sets the host execution limit for automated runs.
+- `icount_shift` optionally sets the QEMU instruction clock shift in both modes.
+- `setup` lists the initial Port B writes. Each write gives `pc`, `addr`,
+  and `value` as hexadecimal strings and `size` as a byte count.
+- `cycle` optionally lists the writes that repeat after setup.
+  `min_cycles` sets the minimum number of complete repetitions.
+  The test checks any trailing writes against the next repetition.
+  If there is no cycle, any write after setup fails the test.
+- `cpu_flow` optionally enables CPU and guest error logging.
+  `idle` gives the idle PC and `min_idle_samples` sets the minimum sample
+  count. If `prefix` is present, the trace must start with those PCs and
+  contain only the idle PC afterward. A write can also specify
+  `cpu_samples` to require its position in the CPU trace.
+
+The six bundled profiles preserve the trace checks from the corresponding
+C and Assembly firmware tests. They verify GPIO behavior in emulation.

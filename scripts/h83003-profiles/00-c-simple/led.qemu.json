@@ -1,0 +1,21 @@
+{
+  "timeout_seconds": 1,
+  "setup": [
+    {
+      "pc": "0x114",
+      "addr": "0xffffd6",
+      "value": "0x1",
+      "size": 1
+    },
+    {
+      "pc": "0x116",
+      "addr": "0xffffd4",
+      "value": "0x1",
+      "size": 1
+    }
+  ],
+  "cpu_flow": {
+    "idle": "0x118",
+    "min_idle_samples": 2
+  }
+}
