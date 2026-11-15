@@ -53,6 +53,9 @@ config TERMINAL3270
 config SH_SCI
     bool
 
+config SC28C94
+    bool
+
 config RENESAS_SCI
     bool
 

@@ -20,6 +20,7 @@
 #include "hw/boards.h"
 #include "hw/char/renesas_sci.h"
 #include "hw/display/hdsp211x.h"
+#include "hw/char/sc28c94.h"
 #include "hw/h8300/h83003_onchip.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
@@ -47,6 +48,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
 #define PORT_REG(a) ((a) - H83003_GPIO_BASE)
 #define H83003_MODE_BASE 0xfffff1
 #define E2300_DISPLAY_BASE 0x800000  /* CS4: HDSP-211x, FL on A5 */
+#define E2300_QUART_BASE 0x810080    /* CS4: SC28C94 quad UART on IRQ0 */
 
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
@@ -59,6 +61,7 @@ struct E2300MachineState {
     H83003OnChipState onchip;
     RSCIState sci0;
     HDSP211XState display;
+    SC28C94State quart;
     RSCIState sci1;
     qemu_irq wovi;
     MemoryRegion flash;
@@ -547,6 +550,18 @@ static void e2300_init(MachineState *machine)
                             TYPE_HDSP211X);
     sysbus_realize(SYS_BUS_DEVICE(&s->display), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->display), 0, E2300_DISPLAY_BASE);
+
+    /*
+     * Quad UART used by the operating system (inisams, testsams and
+     * putrs/getrs/checkrs channels 0x10-0x13).  Each channel can be
+     * connected with -global sc28c94.chardevN=<id>.
+     */
+    object_initialize_child(OBJECT(machine), "quart", &s->quart,
+                            TYPE_SC28C94);
+    sysbus_realize(SYS_BUS_DEVICE(&s->quart), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->quart), 0, E2300_QUART_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->quart), 0,
+                       qdev_get_gpio_in_named(onchip, "irq-pin", 0));
     sysbus_connect_irq(SYS_BUS_DEVICE(onchip), 0,
                        qdev_get_gpio_in(DEVICE(&s->cpu), H8300_CPU_IRQ));
     s->cpu.env.ack = qdev_get_gpio_in_named(onchip, "ack", 0);
