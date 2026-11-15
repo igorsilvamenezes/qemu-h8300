@@ -26,7 +26,6 @@ def find_profile(rom):
     if rom.parent.name == "build":
         project = rom.parent.parent
         candidates.append(project / name)
-        candidates.append(SCRIPTS / "h83003-profiles" / project.name / name)
     return next((path for path in candidates if path.is_file()), None)
 
 
