@@ -19,7 +19,6 @@
 #include "hw/misc/battery_sensor.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
-#include "sysemu/reset.h"
 #include "trace.h"
 
 bool battery_sensor_is_low(BatterySensorState *s)
@@ -65,18 +64,10 @@ static bool battery_sensor_get_low(Object *obj, Error **errp)
     return battery_sensor_is_low(BATTERY_SENSOR(obj));
 }
 
+/* Without a bus, the board has to reset the sensor itself. */
 static void battery_sensor_reset(DeviceState *dev)
 {
     battery_sensor_update(BATTERY_SENSOR(dev));
-}
-
-/*
- * The sensor usually hangs off a board without a bus, so system reset does
- * not reach it on its own; drive the output again at every reset.
- */
-static void battery_sensor_system_reset(void *opaque)
-{
-    device_cold_reset(DEVICE(opaque));
 }
 
 static void battery_sensor_realize(DeviceState *dev, Error **errp)
@@ -87,12 +78,6 @@ static void battery_sensor_realize(DeviceState *dev, Error **errp)
         s->description = g_strdup("n/a");
     }
     qdev_init_gpio_out_named(dev, &s->low_out, "low", 1);
-    qemu_register_reset(battery_sensor_system_reset, dev);
-}
-
-static void battery_sensor_unrealize(DeviceState *dev)
-{
-    qemu_unregister_reset(battery_sensor_system_reset, dev);
 }
 
 static void battery_sensor_init(Object *obj)
@@ -144,7 +129,6 @@ static void battery_sensor_class_init(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_battery_sensor;
     dc->reset = battery_sensor_reset;
     dc->realize = battery_sensor_realize;
-    dc->unrealize = battery_sensor_unrealize;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     device_class_set_props(dc, battery_sensor_properties);
 }

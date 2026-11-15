@@ -307,12 +307,14 @@ grlib_apb_pnp_read(uint64_t addr, unsigned size, uint32_t value) "APB PnP read a
 # gpio_beeper.c
 gpio_beeper_on(const char *desc, uint32_t count) "'%s' on (beep #%u)"
 gpio_beeper_off(const char *desc, int64_t ms) "'%s' off after %" PRId64 " ms"
+gpio_beeper_reset(const char *desc, int on, uint32_t count) "'%s' reset (was on %d, %u beeps)"
 
 # turnstile.c
 turnstile_solenoid(const char *desc, const char *state) "'%s' arm %s"
 turnstile_push(const char *desc, const char *how) "'%s' arm pushed: %s"
 turnstile_switch(const char *desc, int sw, int closed) "'%s' SW%d %d"
 turnstile_passage(const char *desc, uint32_t count) "'%s' passage #%u"
+turnstile_reset(const char *desc, int released, uint32_t phase, uint32_t passages) "'%s' reset (was released %d, phase %u, %u passages)"
 
 # battery_sensor.c
 battery_sensor_level(const char *desc, uint32_t mv, uint32_t threshold_mv, const char *state) "'%s' %u mV (threshold %u mV): %s"
@@ -329,6 +331,7 @@ led_change_intensity(const char *color, const char *desc, uint8_t old_intensity_
 
 # dip_switch.c
 dip_switch_set(const char *label, const char *positions, uint32_t value) "%s %s (0x%x)"
+dip_switch_reset(const char *label, uint32_t value) "%s reset, positions kept (0x%x)"
 
 # pca9552.c
 pca955x_gpio_status(const char *description, const char *buf) "%s GPIOs 0-15 [%s]"

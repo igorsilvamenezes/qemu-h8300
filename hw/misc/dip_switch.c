@@ -175,7 +175,10 @@ static void dip_switch_realize(DeviceState *dev, Error **errp)
 /* Switches keep their positions over a reset; refresh the outputs. */
 static void dip_switch_reset(DeviceState *dev)
 {
-    dip_switch_drive(DIP_SWITCH(dev));
+    DIPSwitchState *s = DIP_SWITCH(dev);
+
+    trace_dip_switch_reset(s->label ? s->label : "", s->positions);
+    dip_switch_drive(s);
 }
 
 static int dip_switch_post_load(void *opaque, int version_id)

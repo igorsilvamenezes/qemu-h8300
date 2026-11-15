@@ -130,14 +130,25 @@ static bool turnstile_get_released(Object *obj, Error **errp)
     return TURNSTILE(obj)->released;
 }
 
+/*
+ * The arm comes back locked and at rest, and the switch outputs are driven
+ * open again: a reset in the middle of a rotation must not leave them
+ * closed on the controller side.
+ */
 static void turnstile_reset(DeviceState *dev)
 {
     TurnstileState *s = TURNSTILE(dev);
+    int i;
 
+    trace_turnstile_reset(s->description, s->released, s->phase,
+                          s->passages);
     timer_del(s->timer);
     s->released = false;
     s->phase = TURNSTILE_IDLE;
     s->passages = 0;
+    for (i = 0; i < TURNSTILE_SWITCHES; i++) {
+        qemu_set_irq(s->sw[i], 0);
+    }
 }
 
 static void turnstile_realize(DeviceState *dev, Error **errp)
