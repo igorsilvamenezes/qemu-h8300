@@ -1,5 +1,10 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# hdsp211x.c
+hdsp211x_read(uint64_t addr, uint8_t val) "addr 0x%02"PRIx64" val 0x%02x"
+hdsp211x_write(uint64_t addr, uint64_t val) "addr 0x%02"PRIx64" val 0x%02"PRIx64
+hdsp211x_display(const char *text, const char *flash, unsigned brightness) "|%s| flash %s bright %u%%"
+
 # jazz_led.c
 jazz_led_read(uint64_t addr, uint8_t val) "read addr=0x%"PRIx64": 0x%x"
 jazz_led_write(uint64_t addr, uint8_t new) "write addr=0x%"PRIx64": 0x%x"

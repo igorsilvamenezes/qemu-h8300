@@ -19,6 +19,7 @@
 #include "cpu.h"
 #include "hw/boards.h"
 #include "hw/char/renesas_sci.h"
+#include "hw/display/hdsp211x.h"
 #include "hw/h8300/h83003_onchip.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
@@ -45,6 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
 #define H83003_GPIO_SIZE 0x17   /* P4DDR (0xFFFFC5) to P5PCR (0xFFFFDB) */
 #define PORT_REG(a) ((a) - H83003_GPIO_BASE)
 #define H83003_MODE_BASE 0xfffff1
+#define E2300_DISPLAY_BASE 0x800000  /* CS4: HDSP-211x, FL on A5 */
 
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
@@ -56,6 +58,7 @@ struct E2300MachineState {
     H8300CPU cpu;
     H83003OnChipState onchip;
     RSCIState sci0;
+    HDSP211XState display;
     RSCIState sci1;
     qemu_irq wovi;
     MemoryRegion flash;
@@ -534,6 +537,16 @@ static void e2300_init(MachineState *machine)
     qdev_prop_set_uint64(onchip, "clock-frequency", E2300_CLOCK_HZ);
     sysbus_realize(SYS_BUS_DEVICE(onchip), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(onchip), 0, H83003_ONCHIP_BASE, -1);
+
+    /*
+     * Front panel display.  Its text can be logged with
+     * -chardev file,id=disp,path=display.log -global hdsp-211x.chardev=disp
+     * or with -trace hdsp211x_display.
+     */
+    object_initialize_child(OBJECT(machine), "display", &s->display,
+                            TYPE_HDSP211X);
+    sysbus_realize(SYS_BUS_DEVICE(&s->display), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->display), 0, E2300_DISPLAY_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(onchip), 0,
                        qdev_get_gpio_in(DEVICE(&s->cpu), H8300_CPU_IRQ));
     s->cpu.env.ack = qdev_get_gpio_in_named(onchip, "ack", 0);
