@@ -21,6 +21,8 @@
 #include "hw/char/renesas_sci.h"
 #include "hw/char/rfm433.h"
 #include "hw/display/hdsp211x.h"
+#include "hw/misc/gpio_beeper.h"
+#include "hw/misc/led.h"
 #include "hw/misc/mifare_mcm.h"
 #include "hw/char/sc28c94.h"
 #include "hw/h8300/h83003_onchip.h"
@@ -58,6 +60,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
 #define E2300_I2C_SDA 0x04           /* PB2, open drain through PBDDR */
 #define E2300_RTC_ADDR 0x68          /* DS1307-compatible clock, 0xD0/0xD1 */
 
+/*
+ * Front panel outputs on port 4, set by the OS lamps() call.  The yellow
+ * and green LEDs are not in lamps() bit order: RED 0x10 drives P4.0,
+ * GREEN 0x40 P4.1, YELLOW 0x20 P4.2 and BEEP 0x80 P4.3, all active high.
+ */
+enum {
+    E2300_PANEL_RED,
+    E2300_PANEL_GREEN,
+    E2300_PANEL_YELLOW,
+    E2300_PANEL_BEEP,
+    E2300_PANEL_LINES
+};
+
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
     FLASH_ARRAY, FLASH_ID, FLASH_STATUS, FLASH_PROGRAM, FLASH_ERASE,
@@ -73,6 +88,8 @@ struct E2300MachineState {
     SC28C94State quart;
     RSCIState sci1;
     qemu_irq wovi;
+    qemu_irq panel[E2300_PANEL_LINES];  /* P4.0-P4.3 */
+    uint8_t panel_level;
     MemoryRegion flash;
     MemoryRegion absent;
     MemoryRegion iram;
@@ -269,6 +286,21 @@ static void e2300_i2c_update(E2300MachineState *s)
     }
 }
 
+/* Drive the front panel LEDs and beeper from the P4 output pins. */
+static void e2300_panel_update(E2300MachineState *s, bool force)
+{
+    uint8_t level = s->port[PORT_REG(0xffffc7)] & s->port[PORT_REG(0xffffc5)];
+    uint8_t changed = force ? 0xff : level ^ s->panel_level;
+    int i;
+
+    s->panel_level = level;
+    for (i = 0; i < E2300_PANEL_LINES; i++) {
+        if (changed & BIT(i)) {
+            qemu_set_irq(s->panel[i], extract32(level, i, 1));
+        }
+    }
+}
+
 /* Level of the pins configured as inputs. */
 static uint8_t port_pins(E2300MachineState *s, hwaddr reg)
 {
@@ -315,6 +347,9 @@ static void gpio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     if (reg == 0xffffd4 || reg == 0xffffd6) {
         trace_h83003_portb_write(s->cpu.env.pc, reg, val, size);
         e2300_i2c_update(s);
+    }
+    if (reg == 0xffffc5 || reg == 0xffffc7) {
+        e2300_panel_update(s, false);
     }
 }
 
@@ -478,6 +513,8 @@ static void e2300_reset(MachineState *machine, ShutdownCause reason)
     s->wdt_reset_pending = false;
 
     qemu_devices_reset(reason);
+    /* The LED devices reset to "on"; show the pins, all low after reset. */
+    e2300_panel_update(s, true);
     cpu_reset(CPU(&s->cpu));
     /* Reset fetches from the live flash, so programming survives reset. */
     cpu_set_pc(CPU(&s->cpu), ldl_be_p(data) & 0xffffff);
@@ -601,6 +638,24 @@ static void e2300_init(MachineState *machine)
                             TYPE_HDSP211X);
     sysbus_realize(SYS_BUS_DEVICE(&s->display), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->display), 0, E2300_DISPLAY_BASE);
+
+    /*
+     * Front panel lamps on port 4, one device each so that they show up
+     * separately: -trace led_change_intensity reports the LEDs (desc 'red',
+     * 'green', 'yellow') and -trace "gpio_beeper*" the beeper; "qom-get
+     * /machine/beeper on" reads it.
+     */
+    s->panel[E2300_PANEL_RED] = qdev_get_gpio_in(DEVICE(
+        led_create_simple(OBJECT(machine), GPIO_POLARITY_ACTIVE_HIGH,
+                          LED_COLOR_RED, "red")), 0);
+    s->panel[E2300_PANEL_GREEN] = qdev_get_gpio_in(DEVICE(
+        led_create_simple(OBJECT(machine), GPIO_POLARITY_ACTIVE_HIGH,
+                          LED_COLOR_GREEN, "green")), 0);
+    s->panel[E2300_PANEL_YELLOW] = qdev_get_gpio_in(DEVICE(
+        led_create_simple(OBJECT(machine), GPIO_POLARITY_ACTIVE_HIGH,
+                          LED_COLOR_YELLOW, "yellow")), 0);
+    s->panel[E2300_PANEL_BEEP] = qdev_get_gpio_in(DEVICE(
+        gpio_beeper_create_simple(OBJECT(machine), "beeper", "beep")), 0);
 
     /*
      * Proximity card reader.  Give it a card with
