@@ -710,12 +710,17 @@ static inline void h8300_add(int sz, TCGv ret, TCGv arg1, TCGv arg2, bool c)
     }        
     tcg_gen_mov_i32(cpu_ccr_z, cpu_ccr_n);
     tcg_gen_xor_i32(cpu_ccr_v, cpu_ccr_n, arg1);
+    /*
+     * Z must look at the operand size only: INC.W #1 of 0xffff, loaded
+     * zero-extended, gives 0x10000 here and must still set Z.
+     */
     switch(sz) {
     case SZ_B:
         tcg_gen_ext8s_i32(cpu_ccr_n, cpu_ccr_n);
         if (c) {
             tcg_gen_extract_i32(cpu_ccr_c, cpu_ccr_z, 8, 1);
         }
+        tcg_gen_ext8u_i32(cpu_ccr_z, cpu_ccr_z);
         tcg_gen_extract_i32(cpu_ccr_h, cpu_ccr_v, 4, 1);
         break;
     case SZ_W:
@@ -723,6 +728,7 @@ static inline void h8300_add(int sz, TCGv ret, TCGv arg1, TCGv arg2, bool c)
         if (c) {
             tcg_gen_extract_i32(cpu_ccr_c, cpu_ccr_z, 16, 1);
         }
+        tcg_gen_ext16u_i32(cpu_ccr_z, cpu_ccr_z);
         tcg_gen_extract_i32(cpu_ccr_h, cpu_ccr_v, 12, 1);
         break;
     case SZ_L:
@@ -767,6 +773,7 @@ static void h8300_sub(int sz, TCGv ret, TCGv arg1, TCGv arg2, bool c)
         if (c) {
             tcg_gen_extract_i32(cpu_ccr_c, cpu_ccr_v, 8, 1);
         }
+        tcg_gen_ext8u_i32(cpu_ccr_z, cpu_ccr_z);
         tcg_gen_extract_i32(cpu_ccr_h, cpu_ccr_v, 4, 1);
         break;
     case SZ_W:
@@ -774,6 +781,7 @@ static void h8300_sub(int sz, TCGv ret, TCGv arg1, TCGv arg2, bool c)
         if (c) {
             tcg_gen_extract_i32(cpu_ccr_c, cpu_ccr_v, 16, 1);
         }
+        tcg_gen_ext16u_i32(cpu_ccr_z, cpu_ccr_z);
         tcg_gen_extract_i32(cpu_ccr_h, cpu_ccr_v, 12, 1);
         break;
     case SZ_L:
