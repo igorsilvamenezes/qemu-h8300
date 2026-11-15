@@ -25,6 +25,7 @@
 #include "hw/misc/gpio_beeper.h"
 #include "hw/misc/led.h"
 #include "hw/misc/mifare_mcm.h"
+#include "hw/misc/push_button.h"
 #include "hw/misc/turnstile.h"
 #include "hw/char/sc28c94.h"
 #include "hw/h8300/h83003_onchip.h"
@@ -109,6 +110,17 @@ enum {
 #define E2300_GATE_SW1 0x05          /* P6.2, and P6.0 for variant 2 */
 #define E2300_GATE_SW2 0x02          /* P6.1 */
 
+/*
+ * Driver button, read by the V02.13/6 application (drv_bt_detect()): when
+ * readpa() returns 2 for at least one second, and then the button is let
+ * go, the application releases the turnstile (drv_button()).  readpa()
+ * reads the IC2 pins, so the button must pull the IC2 switch 2 line, P8.1,
+ * low, in parallel with the switch [inferred from readpa(); the board
+ * schematic is not available].  It is only seen as 2 with the other
+ * switches OFF, the normal setting.
+ */
+#define E2300_DRIVER_BUTTON 0x02     /* P8.1, low while pressed */
+
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
     FLASH_ARRAY, FLASH_ID, FLASH_STATUS, FLASH_PROGRAM, FLASH_ERASE,
@@ -129,6 +141,8 @@ struct E2300MachineState {
     TurnstileState *turnstile;
     qemu_irq gate;                      /* P4.7, release solenoid */
     uint8_t gate_switches;              /* TURNSTILE_SW1/SW2 bits, 1 = closed */
+    PushButtonState *driver_button;
+    bool driver_button_pressed;
     MemoryRegion flash;
     MemoryRegion absent;
     MemoryRegion iram;
@@ -350,6 +364,14 @@ static void e2300_panel_update(E2300MachineState *s, bool force)
     }
 }
 
+/* The driver button was pressed or released. */
+static void e2300_driver_button(void *opaque, int n, int level)
+{
+    E2300MachineState *s = opaque;
+
+    s->driver_button_pressed = level != 0;
+}
+
 /* A turnstile rotation switch opened or closed. */
 static void e2300_gate_switch(void *opaque, int n, int level)
 {
@@ -361,17 +383,23 @@ static void e2300_gate_switch(void *opaque, int n, int level)
 /* Level of the pins configured as inputs. */
 static uint8_t port_pins(E2300MachineState *s, hwaddr reg)
 {
+    uint8_t pins;
+
     switch (reg) {
     case 0xffffd6: /* PBDR bits 7 and 2, I2C clock and data */
         return ~((s->i2c_scl ? 0 : E2300_I2C_SCL) |
                  (s->i2c_sda_line ? 0 : E2300_I2C_SDA));
-    case 0xffffcf: /* P8DR bits 1-3, IC2 switches 2-4 */
-        return ~dip_switch_get(s->ic2) & 0xe;
+    case 0xffffcf: /* P8DR bits 1-3, IC2 switches 2-4, and driver button */
+        pins = ~dip_switch_get(s->ic2) & 0xe;
+        if (s->driver_button_pressed) {
+            pins &= ~E2300_DRIVER_BUTTON;
+        }
+        return pins;
     case 0xffffd7: /* PCDR bit 4, IC2 switch 1 */
         return (~dip_switch_get(s->ic2) & 0x1) << 4;
     case 0xffffcb: /* P6DR bits 0-2, turnstile switches */
         if (s->turnstile) {
-            uint8_t pins = ~(E2300_GATE_SW1 | E2300_GATE_SW2);
+            pins = ~(E2300_GATE_SW1 | E2300_GATE_SW2);
 
             if (s->gate_switches & BIT(TURNSTILE_SW1)) {
                 pins |= E2300_GATE_SW1;
@@ -618,6 +646,7 @@ static void e2300_reset(MachineState *machine, ShutdownCause reason)
     s->rstcsr = s->wdt_reset_pending ? 0xbf : 0x3f;
     s->wdt_reset_pending = false;
     s->gate_switches = 0;
+    /* The driver button keeps its state: a reset does not let go of it. */
 
     qemu_devices_reset(reason);
     /* The LED devices reset to "on"; show the pins, all low after reset. */
@@ -844,6 +873,20 @@ static void e2300_init(MachineState *machine)
                                                           s, i));
         }
     }
+
+    /*
+     * Driver button on P8.1.  "qom-set /machine/driver-button press on"
+     * presses it for 3 s (-global push-button.hold-time=<ms> changes that);
+     * "qom-set /machine/driver-button pressed on|off" holds and releases
+     * it.  The application looks at the button once per main loop pass and
+     * then wants it held for one more second, so a press must outlast the
+     * loop: with the radio still searching for a base, 1.5 s is not always
+     * enough.  -trace push_button_state shows the button.
+     */
+    s->driver_button = push_button_create_simple(OBJECT(machine),
+                                                 "driver-button", "driver");
+    qdev_connect_gpio_out(DEVICE(s->driver_button), 0,
+                          qemu_allocate_irq(e2300_driver_button, s, 0));
 
     /*
      * Proximity card reader.  Give it a card with

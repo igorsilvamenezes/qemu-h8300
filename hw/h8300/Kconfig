@@ -38,6 +38,7 @@ config H8300_E2300
     select HDSP211X
     select LED
     select MIFARE_MCM
+    select PUSH_BUTTON
     select SC28C94
     select RFM433
     select RENESAS_SCI
