@@ -15,6 +15,12 @@
 - Use English for source comments and project instructions. Communicate
   with the user in Portuguese.
 
+## Microcontroller specifications
+
+- The files under [`H8300/docs`](../docs/)
+  (`/home/igor/ESTUDO-FIRMWARE/H8300/docs`) are the authoritative sources
+  for the H8/3003 microcontroller.
+
 ## Emulator and launcher
 
 - Build the `h8300-softmmu` target. The workspace launcher defaults to
@@ -92,10 +98,10 @@ qemu-h83003 --test --profile expectations.json build/blink.bin
   external 16-bit ROM with three access states and three wait states.
   The reference profiles use `icount_shift` 9 for Assembly and 10 for C
   blink examples. Those settings control simulated time.
-- Consult the local H8/3003 hardware manual, H8/300 programming manual,
-  and H8/300H reference before selecting register addresses, instructions,
-  or timings. The H8/3003 hardware manual covers Port B in section 9.9
-  and instruction timing in tables A-2 and A-3.
+- Consult the H8/3003 hardware manual, H8/300 programming manual, and
+  H8/300H reference in [`H8300/docs`](../docs/) before selecting register
+  addresses, instructions, or timings. The H8/3003 hardware manual covers
+  Port B in section 9.9 and instruction timing in tables A-2 and A-3.
 - Reference LEDs are active high. Write the initial latch value to
   `PBDR` at `0xFFFFD6` before enabling outputs. Write `PBDDR` at
   `0xFFFFD4` directly because it is write-only. Use `0x01` for PB0 or
