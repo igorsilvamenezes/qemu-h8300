@@ -11,6 +11,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
@@ -21,6 +22,7 @@
 #include "hw/char/renesas_sci.h"
 #include "hw/char/rfm433.h"
 #include "hw/display/hdsp211x.h"
+#include "hw/misc/battery_sensor.h"
 #include "hw/misc/dip_switch.h"
 #include "hw/misc/gpio_beeper.h"
 #include "hw/misc/led.h"
@@ -109,6 +111,20 @@ enum {
 #define E2300_GATE_SW1 0x05          /* P6.2, and P6.0 for variant 2 */
 #define E2300_GATE_SW2 0x02          /* P6.1 */
 
+/*
+ * Backup battery detector on PC6, high when the lithium cell is low.  The
+ * OS samples it once at startup and sets bit 0x80 ("battery ok") of the
+ * status word at 0x100000 when the pin is low; the boot clears that word
+ * at every power-up.  The application shows "BAT ERR" when the bit is
+ * clear (MBODY.C print_software_info).  So a change of the battery shows
+ * after the next reset, as the board's production test describes it ("as
+ * recorded at the last power-up").  The threshold of the real detector is
+ * not documented; the device defaults to 3 V and 2.5 V.
+ */
+#define E2300_BATTERY_LOW 0x40       /* PC6 */
+#define E2300_BATTERY_OK_MV 3000
+#define E2300_BATTERY_LOW_MV 2000
+
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
     FLASH_ARRAY, FLASH_ID, FLASH_STATUS, FLASH_PROGRAM, FLASH_ERASE,
@@ -148,6 +164,9 @@ struct E2300MachineState {
     bool autoboot;
     bool radio;
     bool has_turnstile;
+    BatterySensorState *battery;
+    bool battery_low;       /* PC6 level from the battery detector */
+    char *battery_mode;     /* "battery" machine property */
     char *switches;         /* "switches" machine property */
     DIPSwitchState *ic2;
     int ic2_traced;         /* positions last reported, -1 for none */
@@ -367,8 +386,9 @@ static uint8_t port_pins(E2300MachineState *s, hwaddr reg)
                  (s->i2c_sda_line ? 0 : E2300_I2C_SDA));
     case 0xffffcf: /* P8DR bits 1-3, IC2 switches 2-4 */
         return ~dip_switch_get(s->ic2) & 0xe;
-    case 0xffffd7: /* PCDR bit 4, IC2 switch 1 */
-        return (~dip_switch_get(s->ic2) & 0x1) << 4;
+    case 0xffffd7: /* PCDR bit 4, IC2 switch 1; bit 6, battery low */
+        return (~dip_switch_get(s->ic2) & 0x1) << 4 |
+               (s->battery_low ? E2300_BATTERY_LOW : 0);
     case 0xffffcb: /* P6DR bits 0-2, turnstile switches */
         if (s->turnstile) {
             uint8_t pins = ~(E2300_GATE_SW1 | E2300_GATE_SW2);
@@ -681,6 +701,49 @@ static void e2300_init_sci(E2300MachineState *s, RSCIState *sci,
     }
 }
 
+/* The battery detector output changed. */
+static void e2300_battery_changed(void *opaque, int n, int level)
+{
+    E2300MachineState *s = opaque;
+
+    s->battery_low = level != 0;
+}
+
+/* Turn the "battery" property (ok, low or a voltage in mV) into mV. */
+static bool e2300_battery_mv(const char *value, uint32_t *mv, Error **errp)
+{
+    uint64_t v;
+
+    if (!g_ascii_strcasecmp(value, "ok")) {
+        *mv = E2300_BATTERY_OK_MV;
+    } else if (!g_ascii_strcasecmp(value, "low")) {
+        *mv = E2300_BATTERY_LOW_MV;
+    } else if (!qemu_strtou64(value, NULL, 0, &v) && v <= UINT32_MAX) {
+        *mv = v;
+    } else {
+        error_setg(errp, "battery must be ok, low or a voltage in mV");
+        return false;
+    }
+    return true;
+}
+
+static void e2300_init_battery(E2300MachineState *s)
+{
+    uint32_t mv;
+
+    s->battery = battery_sensor_create_simple(OBJECT(s), "backup-battery",
+                                              "backup battery");
+    qdev_connect_gpio_out_named(DEVICE(s->battery), "low", 0,
+                                qemu_allocate_irq(e2300_battery_changed, s,
+                                                  0));
+    /* -global battery-sensor.voltage=... works too without "battery". */
+    if (s->battery_mode) {
+        e2300_battery_mv(s->battery_mode, &mv, &error_fatal);
+        object_property_set_uint(OBJECT(s->battery), "voltage", mv,
+                                 &error_fatal);
+    }
+}
+
 /* Translate the "switches" presets into dip-switch positions. */
 static const char *e2300_switch_preset(const char *name)
 {
@@ -827,6 +890,15 @@ static void e2300_init(MachineState *machine)
         gpio_beeper_create_simple(OBJECT(machine), "beeper", "beep")), 0);
 
     /*
+     * Backup battery detector on PC6.  battery=low (or a voltage in mV
+     * below the 2500 mV threshold) makes the application show "BAT ERR";
+     * "qom-set /machine battery low" or "qom-set /machine/backup-battery
+     * voltage 2200" change it at run time, seen by the firmware after the
+     * next reset.  -trace battery_sensor_level reports the detector.
+     */
+    e2300_init_battery(s);
+
+    /*
      * Turnstile on P4.7 (solenoid) and P6 (switches), unless turnstile=off,
      * which leaves P6 pulled up: checkgate() then reports a completed
      * rotation at once.  A passenger passes one second after each release;
@@ -947,6 +1019,33 @@ static void e2300_set_turnstile(Object *obj, bool enabled, Error **errp)
     E2300_MACHINE(obj)->has_turnstile = enabled;
 }
 
+static char *e2300_get_battery(Object *obj, Error **errp)
+{
+    E2300MachineState *s = E2300_MACHINE(obj);
+
+    if (s->battery) {
+        return g_strdup(battery_sensor_is_low(s->battery) ? "low" : "ok");
+    }
+    return g_strdup(s->battery_mode ? s->battery_mode : "ok");
+}
+
+static void e2300_set_battery(Object *obj, const char *value, Error **errp)
+{
+    E2300MachineState *s = E2300_MACHINE(obj);
+    uint32_t mv;
+
+    if (!e2300_battery_mv(value, &mv, errp)) {
+        return;
+    }
+    if (s->battery) {
+        /* At run time, change the voltage of the existing battery. */
+        object_property_set_uint(OBJECT(s->battery), "voltage", mv, errp);
+        return;
+    }
+    g_free(s->battery_mode);
+    s->battery_mode = g_strdup(value);
+}
+
 static void e2300_instance_init(Object *obj)
 {
     E2300_MACHINE(obj)->radio = true;
@@ -957,6 +1056,7 @@ static void e2300_instance_init(Object *obj)
 static void e2300_instance_finalize(Object *obj)
 {
     g_free(E2300_MACHINE(obj)->switches);
+    g_free(E2300_MACHINE(obj)->battery_mode);
 }
 
 static void e2300_class_init(ObjectClass *oc, void *data)
@@ -989,6 +1089,11 @@ static void e2300_class_init(ObjectClass *oc, void *data)
     object_class_property_set_description(oc, "turnstile",
         "Turnstile on P4.7 (solenoid) and P6 (switches); "
         "off leaves P6 pulled up");
+    object_class_property_add_str(oc, "battery",
+                                  e2300_get_battery, e2300_set_battery);
+    object_class_property_set_description(oc, "battery",
+        "Backup battery: ok (default), low or a voltage in mV; "
+        "the firmware sees a change after the next reset");
 }
 
 static const TypeInfo e2300_type = {
