@@ -18,6 +18,7 @@ Contents:
 
    target-arm
    target-avr
+   target-h8300
    target-m68k
    target-mips
    target-ppc

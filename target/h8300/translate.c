@@ -249,18 +249,9 @@ void h8300_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     }
 }
 
-static bool use_goto_tb(DisasContext *dc, target_ulong dest)
-{
-    if (unlikely(dc->base.singlestep_enabled)) {
-        return false;
-    } else {
-        return true;
-    }
-}
-
 static void gen_goto_tb(DisasContext *dc, int n, target_ulong dest)
 {
-    if (use_goto_tb(dc, dest)) {
+    if (translator_use_goto_tb(&dc->base, dest)) {
         tcg_gen_goto_tb(n);
         tcg_gen_movi_i32(cpu_pc, dest);
         tcg_gen_exit_tb(dc->base.tb, n);
@@ -697,11 +688,12 @@ static bool trans_STM(DisasContext *ctx, arg_STM *a)
 
 static inline void h8300_add(int sz, TCGv ret, TCGv arg1, TCGv arg2, bool c)
 {
-    TCGv z;
-    z = tcg_constant_i32(0);
+    TCGv sign_diff = tcg_temp_new();
 
     if (c) {
-        tcg_gen_add2_i32(cpu_ccr_n, cpu_ccr_c, arg1, z, arg2, z);
+        TCGv zero = tcg_constant_i32(0);
+
+        tcg_gen_add2_i32(cpu_ccr_n, cpu_ccr_c, arg1, zero, arg2, zero);
     } else {
         tcg_gen_add_i32(cpu_ccr_n, arg1, arg2);
     }        
@@ -728,15 +720,14 @@ static inline void h8300_add(int sz, TCGv ret, TCGv arg1, TCGv arg2, bool c)
     default:
         g_assert_not_reached();
     }
-    tcg_gen_xor_i32(z, arg1, arg2);
-    tcg_gen_andc_i32(cpu_ccr_v, cpu_ccr_v, z);
+    tcg_gen_xor_i32(sign_diff, arg1, arg2);
+    tcg_gen_andc_i32(cpu_ccr_v, cpu_ccr_v, sign_diff);
     tcg_gen_mov_i32(ret, cpu_ccr_n);
 }
 
 static inline void h8300_addx(TCGv ret, TCGv arg1, TCGv arg2)
 {
-    TCGv z;
-    z = tcg_constant_i32(0);
+    TCGv sign_diff = tcg_temp_new();
 
     tcg_gen_add_i32(cpu_ccr_n, arg1, cpu_ccr_c);
     tcg_gen_add_i32(cpu_ccr_n, cpu_ccr_n, arg2);
@@ -745,8 +736,8 @@ static inline void h8300_addx(TCGv ret, TCGv arg1, TCGv arg2)
     tcg_gen_xor_i32(cpu_ccr_v, cpu_ccr_n, arg1);
     tcg_gen_extract_i32(cpu_ccr_h, cpu_ccr_v, 4, 1);
     tcg_gen_extract_i32(cpu_ccr_c, cpu_ccr_v, 8, 1);
-    tcg_gen_xor_i32(z, arg1, arg2);
-    tcg_gen_andc_i32(cpu_ccr_v, cpu_ccr_v, z);
+    tcg_gen_xor_i32(sign_diff, arg1, arg2);
+    tcg_gen_andc_i32(cpu_ccr_v, cpu_ccr_v, sign_diff);
     tcg_gen_mov_i32(ret, cpu_ccr_n);
 }
 

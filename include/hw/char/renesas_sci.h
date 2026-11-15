@@ -39,6 +39,7 @@ typedef struct {
     int64_t trtime;
     int64_t rx_next;
     QEMUTimer *timer;
+    QEMUTimer rx_timer;
     CharBackend chr;
     uint64_t input_freq;
     qemu_irq irq[SCI_NR_IRQ];

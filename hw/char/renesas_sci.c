@@ -70,6 +70,11 @@ REG8(SEMR, 7)
 static int can_receive(void *opaque)
 {
     RSCIState *sci = RSCI(opaque);
+
+    /* Backpressure the host chardev while the H8 receive register is full. */
+    if (sci->rev == 0 && FIELD_EX8(sci->ssr, SSR, RDRF)) {
+        return 0;
+    }
     if (sci->rx_next > qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
         return 0;
     } else {
@@ -77,10 +82,21 @@ static int can_receive(void *opaque)
     }
 }
 
+static void rx_ready(void *opaque)
+{
+    RSCIState *sci = RSCI(opaque);
+
+    qemu_chr_fe_accept_input(&sci->chr);
+}
+
 static void receive(void *opaque, const uint8_t *buf, int size)
 {
     RSCIState *sci = RSCI(opaque);
     sci->rx_next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + sci->trtime;
+    if (sci->rev == 0) {
+        /* Wake the backend when the character pacing delay has elapsed. */
+        timer_mod(&sci->rx_timer, sci->rx_next);
+    }
     if (FIELD_EX8(sci->ssr, SSR, RDRF) || size > 1) {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, ORER, 1);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
@@ -130,7 +146,13 @@ static void update_trtime(RSCIState *sci)
     sci->trtime += FIELD_EX8(sci->smr, SMR, PE);
     sci->trtime += FIELD_EX8(sci->smr, SMR, STOP) + 1;
     /* x bit transmit time (32 * divrate * brr) / base freq */
-    sci->trtime *= 32 * sci->brr;
+    if (sci->rev == 0 && !FIELD_EX8(sci->smr, SMR, CM)) {
+        /* The H8 asynchronous frame includes a start bit and uses BRR + 1. */
+        sci->trtime++;
+        sci->trtime *= 32 * (sci->brr + 1);
+    } else {
+        sci->trtime *= 32 * sci->brr;
+    }
     sci->trtime *= 1 << (2 * FIELD_EX8(sci->smr, SMR, CKS));
     sci->trtime *= NANOSECONDS_PER_SECOND;
     sci->trtime /= sci->input_freq;
@@ -159,6 +181,10 @@ static void sci_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case A_SCR:
         sci->scr = val;
+        if (sci->rev == 0 && !FIELD_EX8(sci->scr, SCR, TE)) {
+            timer_del(sci->timer);
+            sci->ssr |= R_SSR_TDRE_MASK | R_SSR_TEND_MASK;
+        }
         if ((sci->rev >= 1) && FIELD_EX8(sci->scr, SCR, TE)) {
             sci->ssr = FIELD_DP8(sci->ssr, SSR, TDRE, 1);
             sci->ssr = FIELD_DP8(sci->ssr, SSR, TEND, 1);
@@ -175,7 +201,11 @@ static void sci_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case A_TDR:
         sci->tdr = val;
-        if ((sci->rev >= 1) && FIELD_EX8(sci->ssr, SSR, TEND)) {
+        if (sci->rev == 0) {
+            /* H8 transmission starts when software clears SSR.TDRE. */
+            break;
+        }
+        if (FIELD_EX8(sci->ssr, SSR, TEND)) {
             send_byte(sci);
         } else {
             sci->ssr = FIELD_DP8(sci->ssr, SSR, TDRE, 0);
@@ -184,14 +214,30 @@ static void sci_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case A_SSR:
         sci->ssr = FIELD_DP8(sci->ssr, SSR, MPBT,
                              FIELD_EX8(val, SSR, MPBT));
+        if (sci->rev == 0) {
+            uint8_t clear = sci->read_ssr & ~val &
+                (R_SSR_TDRE_MASK | R_SSR_RDRF_MASK | R_SSR_ERR_MASK);
+
+            sci->ssr &= ~clear;
+            sci->read_ssr &= ~clear;
+            if (!FIELD_EX8(sci->ssr, SSR, ERR)) {
+                qemu_set_irq(sci->irq[ERI], 0);
+            }
+            if ((clear & R_SSR_TDRE_MASK) &&
+                FIELD_EX8(sci->scr, SCR, TE) &&
+                FIELD_EX8(sci->ssr, SSR, TEND)) {
+                send_byte(sci);
+            }
+            if (clear & R_SSR_RDRF_MASK) {
+                qemu_chr_fe_accept_input(&sci->chr);
+            }
+            break;
+        }
         sci->ssr = FIELD_DP8(sci->ssr, SSR, ERR,
                              FIELD_EX8(val, SSR, ERR) & 0x07);
         if (FIELD_EX8(sci->read_ssr, SSR, ERR) &&
             FIELD_EX8(sci->ssr, SSR, ERR) == 0) {
             qemu_set_irq(sci->irq[ERI], 0);
-        }
-        if ((sci->rev == 0) && FIELD_EX8(sci->ssr, SSR, TDRE) == 0) {
-            send_byte(sci);
         }
         break;
     case A_RDR:
@@ -225,7 +271,9 @@ static uint64_t sci_read(void *opaque, hwaddr addr, unsigned size)
         sci->read_ssr = sci->ssr;
         return sci->ssr;
     case A_RDR:
-        sci->ssr = FIELD_DP8(sci->ssr, SSR, RDRF, 0);
+        if (sci->rev != 0) {
+            sci->ssr = FIELD_DP8(sci->ssr, SSR, RDRF, 0);
+        }
         return sci->rdr;
     case A_SCMR:
         return sci->scmr;
@@ -256,7 +304,13 @@ static void rsci_reset(DeviceState *dev)
     sci->ssr = 0x84;
     sci->scmr = 0x00;
     sci->semr = 0x00;
+    sci->read_ssr = 0;
+    timer_del(sci->timer);
+    timer_del(&sci->rx_timer);
     sci->rx_next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (sci->input_freq) {
+        update_trtime(sci);
+    }
 }
 
 static void sci_event(void *opaque, QEMUChrEvent event)
@@ -298,12 +352,25 @@ static void rsci_init(Object *obj)
         sysbus_init_irq(d, &sci->irq[i]);
     }
     sci->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, txend, sci);
+    timer_init_ns(&sci->rx_timer, QEMU_CLOCK_VIRTUAL, rx_ready, sci);
+}
+
+static int rsci_post_load(void *opaque, int version_id)
+{
+    RSCIState *sci = RSCI(opaque);
+
+    timer_del(&sci->rx_timer);
+    if (sci->rev == 0 && sci->rx_next > qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_mod(&sci->rx_timer, sci->rx_next);
+    }
+    return 0;
 }
 
 static const VMStateDescription vmstate_rsci = {
     .name = "renesas-sci",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = rsci_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_INT64(trtime, RSCIState),
         VMSTATE_INT64(rx_next, RSCIState),

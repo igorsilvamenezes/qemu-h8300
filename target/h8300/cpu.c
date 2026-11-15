@@ -41,6 +41,14 @@ static void h8300_cpu_synchronize_from_tb(CPUState *cs,
     cpu->env.pc = tb->pc;
 }
 
+/* Resume at the faulting instruction when TCG recompiles a block for MMIO. */
+static void h8300_restore_state_to_opc(CPUState *cs,
+                                       const TranslationBlock *tb,
+                                       const uint64_t *data)
+{
+    H8300_CPU(cs)->env.pc = data[0];
+}
+
 static bool h8300_cpu_has_work(CPUState *cs)
 {
     return cs->interrupt_request & CPU_INTERRUPT_HARD;
@@ -174,6 +182,7 @@ static const struct SysemuCPUOps h8300_sysemu_ops = {
 static const struct TCGCPUOps h8300_tcg_ops = {
     .initialize = h8300_translate_init,
     .synchronize_from_tb = h8300_cpu_synchronize_from_tb,
+    .restore_state_to_opc = h8300_restore_state_to_opc,
     .tlb_fill = h8300_cpu_tlb_fill,
 
 #ifndef CONFIG_USER_ONLY
