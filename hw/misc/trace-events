@@ -1,5 +1,11 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# mifare_mcm.c
+mifare_mcm_read(uint64_t addr, uint8_t val) "reg 0x%"PRIx64" val 0x%02x"
+mifare_mcm_write(uint64_t addr, uint64_t val) "reg 0x%"PRIx64" val 0x%02"PRIx64
+mifare_mcm_frame(const char *frame, const char *card) "frame %s (card %s)"
+mifare_mcm_event(const char *msg) "%s"
+
 # allwinner-cpucfg.c
 allwinner_cpucfg_cpu_reset(uint8_t cpu_id, uint32_t reset_addr) "id %u, reset_addr 0x%" PRIx32
 allwinner_cpucfg_read(uint64_t offset, uint64_t data, unsigned size) "offset 0x%" PRIx64 " data 0x%" PRIx64 " size %" PRIu32

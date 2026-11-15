@@ -32,5 +32,6 @@ config H8300_E2300
     bool
     select H8300
     select HDSP211X
+    select MIFARE_MCM
     select SC28C94
     select RENESAS_SCI

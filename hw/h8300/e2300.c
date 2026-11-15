@@ -20,6 +20,7 @@
 #include "hw/boards.h"
 #include "hw/char/renesas_sci.h"
 #include "hw/display/hdsp211x.h"
+#include "hw/misc/mifare_mcm.h"
 #include "hw/char/sc28c94.h"
 #include "hw/h8300/h83003_onchip.h"
 #include "hw/irq.h"
@@ -48,6 +49,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
 #define PORT_REG(a) ((a) - H83003_GPIO_BASE)
 #define H83003_MODE_BASE 0xfffff1
 #define E2300_DISPLAY_BASE 0x800000  /* CS4: HDSP-211x, FL on A5 */
+#define E2300_MIFARE_BASE 0x810010   /* CS4: MIFARE Core Module */
 #define E2300_QUART_BASE 0x810080    /* CS4: SC28C94 quad UART on IRQ0 */
 
 /* Byte-wide Intel 28F002 bottom-boot flash. */
@@ -61,6 +63,7 @@ struct E2300MachineState {
     H83003OnChipState onchip;
     RSCIState sci0;
     HDSP211XState display;
+    MifareMCMState mifare;
     SC28C94State quart;
     RSCIState sci1;
     qemu_irq wovi;
@@ -550,6 +553,17 @@ static void e2300_init(MachineState *machine)
                             TYPE_HDSP211X);
     sysbus_realize(SYS_BUS_DEVICE(&s->display), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->display), 0, E2300_DISPLAY_BASE);
+
+    /*
+     * Proximity card reader.  Give it a card with
+     * -global mifare-mcm.card=card.bin, or place a blank one with
+     * -global mifare-mcm.present=on; "qom-set /machine/mifare present ..."
+     * changes it at run time and -trace mifare_mcm_event shows the traffic.
+     */
+    object_initialize_child(OBJECT(machine), "mifare", &s->mifare,
+                            TYPE_MIFARE_MCM);
+    sysbus_realize(SYS_BUS_DEVICE(&s->mifare), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mifare), 0, E2300_MIFARE_BASE);
 
     /*
      * Quad UART used by the operating system (inisams, testsams and

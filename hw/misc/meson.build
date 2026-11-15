@@ -1,3 +1,4 @@
+system_ss.add(when: 'CONFIG_MIFARE_MCM', if_true: files('mifare_mcm.c'))
 system_ss.add(when: 'CONFIG_APPLESMC', if_true: files('applesmc.c'))
 system_ss.add(when: 'CONFIG_EDU', if_true: files('edu.c'))
 system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('vmcoreinfo.c'))

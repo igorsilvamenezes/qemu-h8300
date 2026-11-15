@@ -1,3 +1,6 @@
+config MIFARE_MCM
+    bool
+
 config APPLESMC
     bool
     depends on ISA_BUS
