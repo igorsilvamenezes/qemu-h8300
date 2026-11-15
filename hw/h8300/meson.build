@@ -1,6 +1,6 @@
 h8300_ss = ss.source_set()
 h8300_ss.add(when: 'CONFIG_H8300_KANEBEBE', if_true: files('kanebebe.c'))
-h8300_ss.add(when: 'CONFIG_H8300_E2300', if_true: files('e2300.c'))
+h8300_ss.add(when: 'CONFIG_H8300_E2300', if_true: files('e2300.c', 'h83003_onchip.c'))
 h8300_ss.add(when: 'CONFIG_H8300_EDOSK2674', if_true: files('edosk2674.c'))
 h8300_ss.add(when: 'CONFIG_H83069', if_true: files('h83069.c'))
 h8300_ss.add(when: 'CONFIG_H8S2674', if_true: files('h8s2674.c'))

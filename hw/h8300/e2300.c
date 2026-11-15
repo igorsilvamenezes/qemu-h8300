@@ -1,9 +1,11 @@
 /*
  * E2300 board with an H8/3003 in advanced mode 3.
  *
- * Models the external memory, GPIO wiring, watchdog reset and SCI1
- * needed by the E2300 boot monitor. Register definitions follow the
- * H8/3003 Hardware Manual, sections 3, 9, 12 and 13.
+ * Models the external memory, I/O ports, watchdog and both SCIs, and
+ * instantiates the H8/3003 on-chip modules (interrupt controller, ITU,
+ * DMAC, TPC, A/D) used by the E2300 boot monitor and operating system.
+ * Register definitions follow the H8/3003 Hardware Manual, sections 3,
+ * 9, 12 and 13.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -17,6 +19,8 @@
 #include "cpu.h"
 #include "hw/boards.h"
 #include "hw/char/renesas_sci.h"
+#include "hw/h8300/h83003_onchip.h"
+#include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
@@ -24,6 +28,7 @@
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "sysemu/sysemu.h"
+#include "trace/trace-system.h"
 
 #define TYPE_E2300_MACHINE MACHINE_TYPE_NAME("e2300")
 OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
@@ -34,8 +39,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
 #define H83003_IRAM_BASE 0xfffd10
 #define H83003_IRAM_SIZE 0x200
 #define H83003_WDT_BASE 0xffffa8
+#define H83003_SCI0_BASE 0xffffb0
 #define H83003_SCI1_BASE 0xffffb8
 #define H83003_GPIO_BASE 0xffffc5
+#define H83003_GPIO_SIZE 0x17   /* P4DDR (0xFFFFC5) to P5PCR (0xFFFFDB) */
+#define PORT_REG(a) ((a) - H83003_GPIO_BASE)
 #define H83003_MODE_BASE 0xfffff1
 
 /* Byte-wide Intel 28F002 bottom-boot flash. */
@@ -46,7 +54,10 @@ enum E2300FlashMode {
 struct E2300MachineState {
     MachineState parent_obj;
     H8300CPU cpu;
+    H83003OnChipState onchip;
+    RSCIState sci0;
     RSCIState sci1;
+    qemu_irq wovi;
     MemoryRegion flash;
     MemoryRegion absent;
     MemoryRegion iram;
@@ -56,7 +67,7 @@ struct E2300MachineState {
     enum E2300FlashMode flash_mode;
     uint8_t flash_status;
     hwaddr flash_dirty_start, flash_dirty_end;
-    uint8_t p4ddr, p4dr, p9ddr, p9dr;
+    uint8_t port[H83003_GPIO_SIZE];
     uint8_t syscr;
     bool autoboot;
     QEMUTimer *wdt_timer;
@@ -119,7 +130,8 @@ static void flash_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     E2300MachineState *s = opaque;
     uint8_t *data = memory_region_get_ram_ptr(&s->flash);
-    bool vpp = s->p4ddr & s->p4dr & 0x40;
+    bool vpp = s->port[PORT_REG(0xffffc5)] & s->port[PORT_REG(0xffffc7)] &
+               0x40;
 
     /* Complete program and erase synchronously, as observed through SR.7. */
     if (s->flash_mode == FLASH_PROGRAM) {
@@ -198,20 +210,51 @@ static const MemoryRegionOps absent_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+/* Data register -> data direction register, or -1 for other registers. */
+static int port_ddr_of(hwaddr reg)
+{
+    switch (reg) {
+    case 0xffffc7: return 0xffffc5;     /* P4 */
+    case 0xffffca: return 0xffffc8;     /* P5 */
+    case 0xffffcb: return 0xffffc9;     /* P6 */
+    case 0xffffcf: return 0xffffcd;     /* P8 */
+    case 0xffffd2: return 0xffffd0;     /* P9, including the SCI pins */
+    case 0xffffd3: return 0xffffd1;     /* PA, including TPC outputs */
+    case 0xffffd6: return 0xffffd4;     /* PB, including TPC outputs */
+    case 0xffffd7: return 0xffffd5;     /* PC */
+    default: return -1;
+    }
+}
+
+/* Level of the pins configured as inputs. */
+static uint8_t port_pins(E2300MachineState *s, hwaddr reg)
+{
+    switch (reg) {
+    case 0xffffcf: /* P8DR bits 1-3, IC2 boot mode switches */
+        return s->autoboot ? 0x02 : 0;
+    case 0xffffd7: /* PCDR bit 4, IC2 boot mode switch */
+        return s->autoboot ? 0x10 : 0;
+    default:       /* undriven inputs are pulled up */
+        return 0xff;
+    }
+}
+
 static uint64_t gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
     E2300MachineState *s = opaque;
+    hwaddr reg = H83003_GPIO_BASE + addr;
+    int ddr_reg = port_ddr_of(reg);
 
-    switch (H83003_GPIO_BASE + addr) {
-    case 0xffffc7: /* P4DR, including flash VPP on P46 */
-        return s->p4dr & s->p4ddr;
-    case 0xffffcf: /* P8DR, boot mode switches */
-        return s->autoboot ? 0x02 : 0;
-    case 0xffffd2: /* P9DR, including the SCI pins */
-        return (s->p9dr & s->p9ddr) | (uint8_t)~s->p9ddr;
-    case 0xffffd7: /* PCDR, boot mode switch */
-        return s->autoboot ? 0x10 : 0;
-    default:
+    if (ddr_reg >= 0) {
+        uint8_t ddr = s->port[PORT_REG(ddr_reg)];
+
+        return (s->port[addr] & ddr) | (port_pins(s, reg) & ~ddr);
+    }
+    switch (reg) {
+    case 0xffffda: /* P4PCR */
+    case 0xffffdb: /* P5PCR */
+        return s->port[addr];
+    default:       /* DDRs are write-only; P7 is an input port */
         return 0xff;
     }
 }
@@ -219,21 +262,22 @@ static uint64_t gpio_read(void *opaque, hwaddr addr, unsigned size)
 static void gpio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     E2300MachineState *s = opaque;
+    hwaddr reg = H83003_GPIO_BASE + addr;
 
-    switch (H83003_GPIO_BASE + addr) {
-    case 0xffffc5:
-        s->p4ddr = val;
-        break;
-    case 0xffffc7:
-        s->p4dr = val;
-        break;
-    case 0xffffd0:
-        s->p9ddr = val;
-        break;
-    case 0xffffd2:
-        s->p9dr = val;
-        break;
+    s->port[addr] = val;
+    /* Port B writes are traced with the PC of the writing instruction. */
+    if (reg == 0xffffd4 || reg == 0xffffd6) {
+        trace_h83003_portb_write(s->cpu.env.pc, reg, val, size);
     }
+}
+
+/* TPC outputs: lines 0-7 drive PA0-PA7, lines 8-15 drive PB0-PB7. */
+static void e2300_tpc_out(void *opaque, int n, int level)
+{
+    E2300MachineState *s = opaque;
+    uint8_t *dr = &s->port[PORT_REG(n < 8 ? 0xffffd3 : 0xffffd6)];
+
+    *dr = deposit32(*dr, n & 7, 1, level != 0);
 }
 
 static const MemoryRegionOps gpio_ops = {
@@ -292,6 +336,12 @@ static void wdt_schedule(E2300MachineState *s, int64_t now)
     }
 }
 
+/* WOVI is requested while OVF = 1 in interval timer mode. */
+static void wdt_update_irq(E2300MachineState *s)
+{
+    qemu_set_irq(s->wovi, (s->tcsr & 0x80) && !(s->tcsr & 0x40));
+}
+
 static void wdt_overflow(void *opaque)
 {
     E2300MachineState *s = opaque;
@@ -300,11 +350,11 @@ static void wdt_overflow(void *opaque)
         s->wdt_reset_pending = true;
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     } else {
-        /* The boot uses watchdog mode only. No interval IRQ is wired. */
+        /* Interval timer mode: set OVF and request WOVI. */
         s->tcsr |= 0x80;
         s->tcnt = 0;
         wdt_schedule(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-        qemu_log_mask(LOG_UNIMP, "e2300: watchdog interval interrupt\n");
+        wdt_update_irq(s);
     }
 }
 
@@ -333,6 +383,7 @@ static void wdt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->tcnt = val & 0x20 ? wdt_count(s, now) : 0;
         s->tcsr = (s->tcsr & val & 0x80) | (val & 0x67) | 0x18;
         wdt_schedule(s, now);
+        wdt_update_irq(s);
     } else if (addr == 0 && (val >> 8) == 0x5a) {
         s->tcnt = val;
         wdt_schedule(s, now);
@@ -365,7 +416,7 @@ static void e2300_reset(MachineState *machine, ShutdownCause reason)
     E2300MachineState *s = E2300_MACHINE(machine);
     const uint8_t *data = memory_region_get_ram_ptr(&s->flash);
 
-    s->p4ddr = s->p4dr = s->p9ddr = s->p9dr = 0;
+    memset(s->port, 0, sizeof(s->port));
     s->syscr = 0x0b;
     memory_region_set_enabled(&s->iram, true);
     s->flash_status = 0x80;
@@ -416,12 +467,34 @@ static void e2300_load_flash(E2300MachineState *s, const char *filename)
     memcpy(data, image, size);
 }
 
+static void e2300_init_sci(E2300MachineState *s, RSCIState *sci,
+                           const char *name, int serial, hwaddr base, int vec)
+{
+    SysBusDevice *sbd;
+    int i;
+
+    object_initialize_child(OBJECT(s), name, sci, TYPE_RENESAS_SCI);
+    sbd = SYS_BUS_DEVICE(sci);
+    qdev_prop_set_chr(DEVICE(sci), "chardev", serial_hd(serial));
+    qdev_prop_set_uint64(DEVICE(sci), "input-freq", E2300_CLOCK_HZ);
+    qdev_prop_set_uint32(DEVICE(sci), "rev", 0);
+    qdev_prop_set_bit(DEVICE(sci), "level-irq", true);
+    sysbus_realize(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, base);
+    for (i = 0; i < SCI_NR_IRQ; i++) {
+        sysbus_connect_irq(sbd, i, qdev_get_gpio_in(DEVICE(&s->onchip),
+                                                    vec + i));
+    }
+}
+
 static void e2300_init(MachineState *machine)
 {
     E2300MachineState *s = E2300_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     Object *owner = OBJECT(machine);
-    SysBusDevice *sci;
+    DeviceState *onchip;
+    qemu_irq *tpc;
+    int i;
 
     if (machine->ram_size != 512 * KiB && machine->ram_size != 1 * MiB) {
         error_report("e2300: RAM size must be 512 KiB or 1 MiB");
@@ -443,7 +516,8 @@ static void e2300_init(MachineState *machine)
     memory_region_init_ram(&s->iram, NULL, "e2300.iram", H83003_IRAM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sysmem, H83003_IRAM_BASE, &s->iram);
-    memory_region_init_io(&s->gpio, owner, &gpio_ops, s, "e2300.gpio", 0x13);
+    memory_region_init_io(&s->gpio, owner, &gpio_ops, s, "e2300.gpio",
+                          H83003_GPIO_SIZE);
     memory_region_add_subregion(sysmem, H83003_GPIO_BASE, &s->gpio);
     memory_region_init_io(&s->mode, owner, &mode_ops, s, "e2300.mode", 2);
     memory_region_add_subregion(sysmem, H83003_MODE_BASE, &s->mode);
@@ -454,13 +528,24 @@ static void e2300_init(MachineState *machine)
     object_initialize_child(owner, "cpu", &s->cpu, TYPE_H8300_CPU);
     qdev_realize(DEVICE(&s->cpu), NULL, &error_fatal);
 
-    object_initialize_child(owner, "sci1", &s->sci1, TYPE_RENESAS_SCI);
-    qdev_prop_set_chr(DEVICE(&s->sci1), "chardev", serial_hd(0));
-    qdev_prop_set_uint64(DEVICE(&s->sci1), "input-freq", E2300_CLOCK_HZ);
-    qdev_prop_set_uint32(DEVICE(&s->sci1), "rev", 0);
-    sci = SYS_BUS_DEVICE(&s->sci1);
-    sysbus_realize(sci, &error_fatal);
-    sysbus_mmio_map(sci, 0, H83003_SCI1_BASE);
+    /* On-chip modules decode the whole 0xFFFF00 page below board devices. */
+    object_initialize_child(owner, "onchip", &s->onchip, TYPE_H83003_ONCHIP);
+    onchip = DEVICE(&s->onchip);
+    qdev_prop_set_uint64(onchip, "clock-frequency", E2300_CLOCK_HZ);
+    sysbus_realize(SYS_BUS_DEVICE(onchip), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(onchip), 0, H83003_ONCHIP_BASE, -1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(onchip), 0,
+                       qdev_get_gpio_in(DEVICE(&s->cpu), H8300_CPU_IRQ));
+    s->cpu.env.ack = qdev_get_gpio_in_named(onchip, "ack", 0);
+    tpc = qemu_allocate_irqs(e2300_tpc_out, s, H83003_TPC_LINES);
+    for (i = 0; i < H83003_TPC_LINES; i++) {
+        qdev_connect_gpio_out_named(onchip, "tpc", i, tpc[i]);
+    }
+    s->wovi = qdev_get_gpio_in(onchip, H83003_VEC_WOVI);
+
+    /* SCI1 is the boot monitor port (-serial #0); SCI0 is -serial #1. */
+    e2300_init_sci(s, &s->sci1, "sci1", 0, H83003_SCI1_BASE, H83003_VEC_SCI1);
+    e2300_init_sci(s, &s->sci0, "sci0", 1, H83003_SCI0_BASE, H83003_VEC_SCI0);
 }
 
 static bool e2300_get_autoboot(Object *obj, Error **errp)
@@ -477,7 +562,7 @@ static void e2300_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "E2300 (H8/3003 boot monitor)";
+    mc->desc = "E2300 (H8/3003 boot monitor and operating system)";
     mc->init = e2300_init;
     mc->reset = e2300_reset;
     mc->default_cpu_type = TYPE_H8300_CPU;

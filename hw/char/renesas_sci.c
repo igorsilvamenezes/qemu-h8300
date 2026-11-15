@@ -67,6 +67,40 @@ REG8(SEMR, 7)
   FIELD(SEMR, ACS0, 0, 1)
   FIELD(SEMR, ABCS, 4, 1)
 
+/*
+ * Event-style outputs (pulses) are used unless "level-irq" is set; then
+ * every output follows its flag AND enable bit, as on the H8/300H, and
+ * sci_update_level_irq() runs after each state change.
+ */
+static void sci_set_irq(RSCIState *sci, int n, int level)
+{
+    if (!sci->level_irq) {
+        qemu_set_irq(sci->irq[n], level);
+    }
+}
+
+static void sci_pulse_irq(RSCIState *sci, int n)
+{
+    if (!sci->level_irq) {
+        qemu_irq_pulse(sci->irq[n]);
+    }
+}
+
+static void sci_update_level_irq(RSCIState *sci)
+{
+    if (!sci->level_irq) {
+        return;
+    }
+    qemu_set_irq(sci->irq[ERI], FIELD_EX8(sci->scr, SCR, RIE) &&
+                 FIELD_EX8(sci->ssr, SSR, ERR));
+    qemu_set_irq(sci->irq[RXI], FIELD_EX8(sci->scr, SCR, RIE) &&
+                 FIELD_EX8(sci->ssr, SSR, RDRF));
+    qemu_set_irq(sci->irq[TXI], FIELD_EX8(sci->scr, SCR, TIE) &&
+                 FIELD_EX8(sci->ssr, SSR, TDRE));
+    qemu_set_irq(sci->irq[TEI], FIELD_EX8(sci->scr, SCR, TEIE) &&
+                 FIELD_EX8(sci->ssr, SSR, TEND));
+}
+
 static int can_receive(void *opaque)
 {
     RSCIState *sci = RSCI(opaque);
@@ -100,15 +134,16 @@ static void receive(void *opaque, const uint8_t *buf, int size)
     if (FIELD_EX8(sci->ssr, SSR, RDRF) || size > 1) {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, ORER, 1);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
-            qemu_set_irq(sci->irq[ERI], 1);
+            sci_set_irq(sci, ERI, 1);
         }
     } else {
         sci->rdr = buf[0];
         sci->ssr = FIELD_DP8(sci->ssr, SSR, RDRF, 1);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
-            qemu_irq_pulse(sci->irq[RXI]);
+            sci_pulse_irq(sci, RXI);
         }
     }
+    sci_update_level_irq(sci);
 }
 
 static void send_byte(RSCIState *sci)
@@ -120,10 +155,11 @@ static void send_byte(RSCIState *sci)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + sci->trtime);
     sci->ssr = FIELD_DP8(sci->ssr, SSR, TEND, 0);
     sci->ssr = FIELD_DP8(sci->ssr, SSR, TDRE, 1);
-    qemu_set_irq(sci->irq[TEI], 0);
+    sci_set_irq(sci, TEI, 0);
     if (FIELD_EX8(sci->scr, SCR, TIE)) {
-        qemu_irq_pulse(sci->irq[TXI]);
+        sci_pulse_irq(sci, TXI);
     }
+    sci_update_level_irq(sci);
 }
 
 static void txend(void *opaque)
@@ -134,9 +170,10 @@ static void txend(void *opaque)
     } else {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, TEND, 1);
         if (FIELD_EX8(sci->scr, SCR, TEIE)) {
-            qemu_set_irq(sci->irq[TEI], 1);
+            sci_set_irq(sci, TEI, 1);
         }
     }
+    sci_update_level_irq(sci);
 }
 
 static void update_trtime(RSCIState *sci)
@@ -189,14 +226,14 @@ static void sci_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             sci->ssr = FIELD_DP8(sci->ssr, SSR, TDRE, 1);
             sci->ssr = FIELD_DP8(sci->ssr, SSR, TEND, 1);
             if (FIELD_EX8(sci->scr, SCR, TIE)) {
-                qemu_irq_pulse(sci->irq[TXI]);
+                sci_pulse_irq(sci, TXI);
             }
         }
         if (!FIELD_EX8(sci->scr, SCR, TEIE)) {
-            qemu_set_irq(sci->irq[TEI], 0);
+            sci_set_irq(sci, TEI, 0);
         }
         if (!FIELD_EX8(sci->scr, SCR, RIE)) {
-            qemu_set_irq(sci->irq[ERI], 0);
+            sci_set_irq(sci, ERI, 0);
         }
         break;
     case A_TDR:
@@ -221,7 +258,7 @@ static void sci_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             sci->ssr &= ~clear;
             sci->read_ssr &= ~clear;
             if (!FIELD_EX8(sci->ssr, SSR, ERR)) {
-                qemu_set_irq(sci->irq[ERI], 0);
+                sci_set_irq(sci, ERI, 0);
             }
             if ((clear & R_SSR_TDRE_MASK) &&
                 FIELD_EX8(sci->scr, SCR, TE) &&
@@ -237,7 +274,7 @@ static void sci_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                              FIELD_EX8(val, SSR, ERR) & 0x07);
         if (FIELD_EX8(sci->read_ssr, SSR, ERR) &&
             FIELD_EX8(sci->ssr, SSR, ERR) == 0) {
-            qemu_set_irq(sci->irq[ERI], 0);
+            sci_set_irq(sci, ERI, 0);
         }
         break;
     case A_RDR:
@@ -251,6 +288,7 @@ static void sci_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         qemu_log_mask(LOG_UNIMP, "renesas_sci: Register 0x%" HWADDR_PRIX
                       " not implemented\n", offset);
     }
+    sci_update_level_irq(sci);
 }
 
 static uint64_t sci_read(void *opaque, hwaddr addr, unsigned size)
@@ -273,6 +311,7 @@ static uint64_t sci_read(void *opaque, hwaddr addr, unsigned size)
     case A_RDR:
         if (sci->rev != 0) {
             sci->ssr = FIELD_DP8(sci->ssr, SSR, RDRF, 0);
+            sci_update_level_irq(sci);
         }
         return sci->rdr;
     case A_SCMR:
@@ -311,6 +350,7 @@ static void rsci_reset(DeviceState *dev)
     if (sci->input_freq) {
         update_trtime(sci);
     }
+    sci_update_level_irq(sci);
 }
 
 static void sci_event(void *opaque, QEMUChrEvent event)
@@ -319,9 +359,10 @@ static void sci_event(void *opaque, QEMUChrEvent event)
     if (event == CHR_EVENT_BREAK) {
         sci->ssr = FIELD_DP8(sci->ssr, SSR, FER, 1);
         if (FIELD_EX8(sci->scr, SCR, RIE)) {
-            qemu_set_irq(sci->irq[ERI], 1);
+            sci_set_irq(sci, ERI, 1);
         }
     }
+    sci_update_level_irq(sci);
 }
 
 static void rsci_realize(DeviceState *dev, Error **errp)
@@ -391,6 +432,7 @@ static const VMStateDescription vmstate_rsci = {
 static Property rsci_properties[] = {
     DEFINE_PROP_UINT64("input-freq", RSCIState, input_freq, 0),
     DEFINE_PROP_UINT32("rev", RSCIState, rev, 1),
+    DEFINE_PROP_BOOL("level-irq", RSCIState, level_irq, false),
     DEFINE_PROP_CHR("chardev", RSCIState, chr),
     DEFINE_PROP_END_OF_LIST(),
 };
