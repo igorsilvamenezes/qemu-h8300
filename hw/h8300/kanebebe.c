@@ -26,9 +26,11 @@
 #include "hw/net/ne2000-local.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/qtest.h"
+#include "sysemu/reset.h"
 #include "sysemu/device_tree.h"
 #include "hw/boards.h"
 #include "qom/object.h"
+#include "trace/trace-system.h"
 
 #define DRAM_BASE 0x00400000
 #define DRAM_SIZE 4 * MiB
@@ -45,6 +47,10 @@ struct KaneBebeMachineState {
     MachineState parent_obj;
     /*< public >*/
     H83069State mcu;
+    bool h83003_portb;
+    MemoryRegion portb;
+    uint8_t pbddr;
+    uint8_t pbdr;
 };
 typedef struct KaneBebeMachineState KaneBebeMachineState;
 
@@ -62,6 +68,58 @@ static void setup_vector(unsigned int base)
         rom_vec[i] = cpu_to_be32(base + i * 4);
     }
     rom_add_blob_fixed("vector", rom_vec, sizeof(rom_vec), 0x000000);
+}
+
+/* Optional test fixture for H8/3003 Port B; input pins are held low. */
+static uint64_t portb_read(void *opaque, hwaddr addr, unsigned size)
+{
+    KaneBebeMachineState *s = opaque;
+
+    return addr == 0 ? 0xff : s->pbdr & s->pbddr;
+}
+
+static void portb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    KaneBebeMachineState *s = opaque;
+
+    if (addr == 0) {
+        s->pbddr = val;
+    } else {
+        s->pbdr = val;
+    }
+    /* Record the guest instruction address alongside the GPIO write. */
+    trace_h83003_portb_write(s->mcu.cpu.env.pc, 0xffffd4 + addr, val, size);
+}
+
+static bool portb_accepts(void *opaque, hwaddr addr, unsigned size,
+                          bool is_write, MemTxAttrs attrs)
+{
+    return size == 1 && (addr == 0 || addr == 2);
+}
+
+static const MemoryRegionOps portb_ops = {
+    .read = portb_read,
+    .write = portb_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.accepts = portb_accepts,
+};
+
+static void portb_reset(void *opaque)
+{
+    KaneBebeMachineState *s = opaque;
+
+    s->pbddr = 0;
+    s->pbdr = 0;
+}
+
+static bool kanebebe_get_h83003_portb(Object *obj, Error **errp)
+{
+    return KANEBEBE_MACHINE(obj)->h83003_portb;
+}
+
+static void kanebebe_set_h83003_portb(Object *obj, bool enabled, Error **errp)
+{
+    KANEBEBE_MACHINE(obj)->h83003_portb = enabled;
 }
 
 static void kanebebe_init(MachineState *machine)
@@ -83,13 +141,20 @@ static void kanebebe_init(MachineState *machine)
         rom_add_file_fixed(machine->firmware, 0, 0);
     }
 
+    if (s->h83003_portb) {
+        memory_region_init_io(&s->portb, OBJECT(s), &portb_ops, s,
+                              "h83003-test-portb", 3);
+        memory_region_add_subregion(sysmem, 0xffffd4, &s->portb);
+        qemu_register_reset(portb_reset, s);
+    }
+
     /* Initalize CPU */
     object_initialize_child(OBJECT(machine), "mcu", &s->mcu, TYPE_H83069);
     object_property_set_link(OBJECT(&s->mcu), "memory", OBJECT(sysmem),
                              &error_abort);
     object_property_set_uint(OBJECT(&s->mcu), "clock-freq", 25000000, &error_abort);
     object_property_set_uint(OBJECT(&s->mcu), "console", 1, &error_abort);
-    qdev_realize(DEVICE(&s->mcu), NULL, &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(&s->mcu), &error_abort);
 
     ne2000_init(&nd_table[0], 0x200000, s->mcu.irq[17]);
 
@@ -122,6 +187,9 @@ static void kanebebe_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
+    object_class_property_add_bool(oc, "h83003-portb",
+                                   kanebebe_get_h83003_portb,
+                                   kanebebe_set_h83003_portb);
     mc->desc = "KaneBebe";
     mc->init = kanebebe_init;
     mc->is_default = 1;
