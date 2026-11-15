@@ -152,6 +152,9 @@ config GPIO_BEEPER
 config TURNSTILE
     bool
 
+config NTC_THERMISTOR
+    bool
+
 config MAC_VIA
     bool
     select MOS6522

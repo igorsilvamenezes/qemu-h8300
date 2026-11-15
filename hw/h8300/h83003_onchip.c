@@ -1226,6 +1226,17 @@ static void onchip_realize(DeviceState *dev, Error **errp)
     timer_init_ns(&s->ad_timer, QEMU_CLOCK_VIRTUAL, ad_timer_cb, s);
 }
 
+/*
+ * Analog input pin AN<n> driven by another device: the level is the
+ * conversion result for that voltage, 0 to 0x3ff (a fraction of AVref).
+ */
+static void onchip_analog_in(void *opaque, int n, int level)
+{
+    H83003OnChipState *s = opaque;
+
+    s->an[n] = MIN(MAX(level, 0), 0x3ff);
+}
+
 static void onchip_init(Object *obj)
 {
     H83003OnChipState *s = H83003_ONCHIP(obj);
@@ -1241,6 +1252,7 @@ static void onchip_init(Object *obj)
     qdev_init_gpio_in(dev, onchip_irq_in, H83003_NR_VECTORS);
     qdev_init_gpio_in_named(dev, onchip_irq_pin, "irq-pin", 8);
     qdev_init_gpio_in_named(dev, onchip_ack, "ack", 1);
+    qdev_init_gpio_in_named(dev, onchip_analog_in, "an", H83003_AN_LINES);
     qdev_init_gpio_out_named(dev, s->tpc_out, "tpc", H83003_TPC_LINES);
 }
 
