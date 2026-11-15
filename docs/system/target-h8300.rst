@@ -37,9 +37,24 @@ the flash without their two-byte transport checksums. The board model
 covers the boot monitor's peripherals. The OS and application can require
 additional devices.
 
+The IC24 DIP switches, ``/machine/ic24``, are only used to replace the
+boot program. ``-M e2300,boot-switches=normal`` (switches 1 and 2 ON,
+3 and 4 OFF) is the default; ``boot-switches=boot-swap`` (1 and 2 OFF,
+3 and 4 ON) inverts flash address line A16, so the CPU sees the flash
+at 0x00000-0x0FFFF and 0x10000-0x1FFFF swapped, and likewise above.
+Other positions log a guest error and keep A16 straight. The A16
+inversion is inferred from the boot's Z1 and Z2 commands and from
+SENDBIN; the board schematic is not available. To replace the boot as
+SENDBIN describes, send the new boot with ``Z1`` (it erases the main
+flash block, 0x8000-0x1FFFF), run ``qom-set /machine boot-switches
+boot-swap`` and ``system_reset`` in the monitor, send ``Z2``, return
+the switches to ``normal`` with another reset, and reload the OS and
+the application. ``-trace e2300_ic24`` reports the switches.
+
 The serial regression uses the original boot image, including its
 transport checksum. It checks the boot CRC, RAM and parameter flash,
-the Z1 upload and Z2 copy, and watchdog reset::
+the Z1 upload and Z2 copy, watchdog reset, and the boot replacement
+through IC24::
 
    python3 tests/h8300/test-e2300.py /path/to/E2300bt1.bin
 

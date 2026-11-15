@@ -2,3 +2,4 @@
 
 # e2300.c
 e2300_switches(const char *positions, unsigned value, const char *mode) "IC2 %s readpa=%u: %s"
+e2300_ic24(const char *positions, unsigned value, const char *mode) "IC24 %s (0x%x): %s"
