@@ -45,6 +45,7 @@ static void gpio_beeper_reset(DeviceState *dev)
 {
     GpioBeeperState *s = GPIO_BEEPER(dev);
 
+    trace_gpio_beeper_reset(s->description, s->on, s->count);
     s->on = false;
     s->on_since_ns = 0;
     s->count = 0;

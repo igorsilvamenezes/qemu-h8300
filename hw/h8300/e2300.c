@@ -172,6 +172,7 @@ struct E2300MachineState {
     qemu_irq wovi;
     qemu_irq panel[E2300_PANEL_LINES];  /* P4.0-P4.3 */
     uint8_t panel_level;
+    GpioBeeperState *beeper;
     TurnstileState *turnstile;
     qemu_irq gate;                      /* P4.7, release solenoid */
     uint8_t gate_switches;              /* TURNSTILE_SW1/SW2 bits, 1 = closed */
@@ -665,6 +666,25 @@ static const MemoryRegionOps wdt_ops = {
     .impl.max_access_size = 2,
 };
 
+/*
+ * The board peripherals are children of the machine with no bus, so
+ * qemu_devices_reset() does not reach them; reset them here, once each.
+ * The LEDs are left out: their only state is the level on their input,
+ * which e2300_panel_update() drives again right after, and led_reset()
+ * would light them for an instant.  The driver button keeps its state: a
+ * reset does not let go of it.  The thermistor has no state to reset and
+ * the A/D converter keeps its input over a reset.
+ */
+static void e2300_reset_peripherals(E2300MachineState *s)
+{
+    device_cold_reset(DEVICE(s->ic2));
+    device_cold_reset(DEVICE(s->battery));
+    device_cold_reset(DEVICE(s->beeper));
+    if (s->turnstile) {
+        device_cold_reset(DEVICE(s->turnstile));
+    }
+}
+
 static void e2300_reset(MachineState *machine, ShutdownCause reason)
 {
     E2300MachineState *s = E2300_MACHINE(machine);
@@ -683,11 +703,10 @@ static void e2300_reset(MachineState *machine, ShutdownCause reason)
     s->tcnt = 0;
     s->rstcsr = s->wdt_reset_pending ? 0xbf : 0x3f;
     s->wdt_reset_pending = false;
-    s->gate_switches = 0;
-    /* The driver button keeps its state: a reset does not let go of it. */
 
     qemu_devices_reset(reason);
-    /* The LED devices reset to "on"; show the pins, all low after reset. */
+    e2300_reset_peripherals(s);
+    /* P4 pins are all low after reset: this re-drives the LEDs too. */
     e2300_panel_update(s, true);
     cpu_reset(CPU(&s->cpu));
     /* Reset fetches from the live flash, so programming survives reset. */
@@ -933,8 +952,8 @@ static void e2300_init(MachineState *machine)
     s->panel[E2300_PANEL_YELLOW] = qdev_get_gpio_in(DEVICE(
         led_create_simple(OBJECT(machine), GPIO_POLARITY_ACTIVE_HIGH,
                           LED_COLOR_YELLOW, "yellow")), 0);
-    s->panel[E2300_PANEL_BEEP] = qdev_get_gpio_in(DEVICE(
-        gpio_beeper_create_simple(OBJECT(machine), "beeper", "beep")), 0);
+    s->beeper = gpio_beeper_create_simple(OBJECT(machine), "beeper", "beep");
+    s->panel[E2300_PANEL_BEEP] = qdev_get_gpio_in(DEVICE(s->beeper), 0);
 
     /*
      * Backup battery detector on PC6.  battery=low (or a voltage in mV
