@@ -425,6 +425,9 @@ static inline void h8300_reg_st(int sz, int rn, TCGv val)
     }
 }
 
+/* N and Z follow the operand size (defined with the ALU helpers). */
+static inline void h8300_ccr_adjust(int sz);
+
 static bool trans_MOV_i(DisasContext *ctx, arg_MOV_i *a)
 {
     TCGv imm = tcg_constant_i32(a->imm);
@@ -441,6 +444,7 @@ static bool trans_MOV_i(DisasContext *ctx, arg_MOV_i *a)
     }
     tcg_gen_mov_i32(cpu_ccr_z, imm);
     tcg_gen_mov_i32(cpu_ccr_n, imm);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }
@@ -466,6 +470,7 @@ static bool trans_MOV_r(DisasContext *ctx, arg_MOV_r *a)
     }
     tcg_gen_mov_i32(cpu_ccr_z, temp);
     tcg_gen_mov_i32(cpu_ccr_n, temp);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }
@@ -490,6 +495,7 @@ static bool trans_MOV_mr(DisasContext *ctx, arg_MOV_mr *a)
     }
     tcg_gen_mov_i32(cpu_ccr_z, temp);
     tcg_gen_mov_i32(cpu_ccr_n, temp);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }
@@ -513,6 +519,7 @@ static bool trans_MOV_mpr(DisasContext *ctx, arg_MOV_mr *a)
     }
     tcg_gen_mov_i32(cpu_ccr_z, temp);
     tcg_gen_mov_i32(cpu_ccr_n, temp);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }
@@ -545,6 +552,7 @@ static bool trans_MOV_ar(DisasContext *ctx, arg_MOV_ar *a)
     }
     tcg_gen_mov_i32(cpu_ccr_z, temp);
     tcg_gen_mov_i32(cpu_ccr_n, temp);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }
@@ -569,6 +577,7 @@ static bool trans_MOV_rm(DisasContext *ctx, arg_MOV_mr *a)
     tcg_gen_qemu_st_i32(temp, mem, 0, a->sz | MO_TE);
     tcg_gen_mov_i32(cpu_ccr_z, temp);
     tcg_gen_mov_i32(cpu_ccr_n, temp);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }
@@ -592,6 +601,7 @@ static bool trans_MOV_rmp(DisasContext *ctx, arg_MOV_mr *a)
     tcg_gen_qemu_st_i32(temp, cpu_regs[a->er], 0, a->sz | MO_TE);
     tcg_gen_mov_i32(cpu_ccr_z, temp);
     tcg_gen_mov_i32(cpu_ccr_n, temp);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }
@@ -624,6 +634,7 @@ static bool trans_MOV_ra(DisasContext *ctx, arg_MOV_ra *a)
     tcg_gen_qemu_st_i32(temp, mem, 0, a->sz | MO_TE);
     tcg_gen_mov_i32(cpu_ccr_z, temp);
     tcg_gen_mov_i32(cpu_ccr_n, temp);
+    h8300_ccr_adjust(a->sz);
     tcg_gen_movi_i32(cpu_ccr_v, 0);
     return true;
 }

@@ -163,7 +163,9 @@ static bool h8300_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
       RX has no-MMU
       Only linear mapping
     */
-    address = physical = addr & TARGET_PAGE_MASK;
+    /* The address bus has 24 lines: the upper byte of ERn is ignored. */
+    address = addr & TARGET_PAGE_MASK;
+    physical = address & 0xffffff;
     prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
     tlb_set_page(cs, address, physical, prot, mmu_idx, TARGET_PAGE_SIZE);
     return true;
