@@ -89,20 +89,28 @@ def main():
     """Build the emulator command and return a status suitable for Make."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rom", type=Path, help="raw firmware image")
+    parser.add_argument("expectations", nargs="?", type=Path,
+                        help="JSON expectations file for --test")
     parser.add_argument("--test", action="store_true", help="verify a bounded run")
     parser.add_argument("--profile", type=Path, help="override automatic profile lookup")
     parser.add_argument("--qemu", default=str(DEFAULT_QEMU), help="QEMU executable")
     parser.add_argument("--log", type=Path, help="override the trace output path")
     args = parser.parse_args()
 
-    profile_path = args.profile or find_profile(args.rom.absolute())
+    if args.expectations is not None:
+        if not args.test:
+            parser.error("a positional expectations file requires --test")
+        if args.profile is not None:
+            parser.error("specify the expectations file once, as an argument or with --profile")
+
+    profile_path = args.expectations or args.profile or find_profile(args.rom.absolute())
     log = args.log or args.rom.parent / ("qemu-trace.log" if args.test else "qemu-run.log")
 
     try:
         if not args.rom.is_file():
             raise ValueError(f"ROM not found: {args.rom}")
         if args.test and profile_path is None:
-            raise ValueError("no test profile found; use --profile")
+            raise ValueError("no test profile found; pass an expectations file or use --profile")
         profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path else {}
         if not isinstance(profile, dict):
             raise ValueError("profile must contain a JSON object")
