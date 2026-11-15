@@ -158,6 +158,9 @@ config BATTERY_SENSOR
 config PUSH_BUTTON
     bool
 
+config NTC_THERMISTOR
+    bool
+
 config MAC_VIA
     bool
     select MOS6522

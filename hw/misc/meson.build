@@ -14,6 +14,7 @@ system_ss.add(when: 'CONFIG_GPIO_BEEPER', if_true: files('gpio_beeper.c'))
 system_ss.add(when: 'CONFIG_TURNSTILE', if_true: files('turnstile.c'))
 system_ss.add(when: 'CONFIG_BATTERY_SENSOR', if_true: files('battery_sensor.c'))
 system_ss.add(when: 'CONFIG_PUSH_BUTTON', if_true: files('push_button.c'))
+system_ss.add(when: 'CONFIG_NTC_THERMISTOR', if_true: files('ntc_thermistor.c'))
 system_ss.add(when: 'CONFIG_PVPANIC_COMMON', if_true: files('pvpanic.c'))
 
 # ARM devices

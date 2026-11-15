@@ -22,6 +22,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(H83003OnChipState, H83003_ONCHIP)
 #define H83003_NR_VECTORS 64
 #define H83003_TPC_LINES 16     /* PA0-PA7, PB0-PB7 */
 
+/*
+ * GPIO lines: unnamed inputs are the internal interrupt vectors, "irq-pin"
+ * IRQ0-IRQ7, "ack" the CPU interrupt acknowledge and the "tpc" outputs
+ * the TPC pins.  The 8 "an" inputs are the analog pins AN0-AN7: the level
+ * is the conversion result (0-0x3ff, a fraction of AVref), which replaces
+ * the value of the "anN" property.
+ */
+#define H83003_AN_LINES 8
+
 /* Vector numbers used by board-level interrupt sources. */
 #define H83003_VEC_WOVI 20
 #define H83003_VEC_SCI0 52      /* ERI0, RXI0, TXI0, TEI0 */

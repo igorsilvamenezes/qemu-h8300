@@ -28,6 +28,7 @@
 #include "hw/misc/led.h"
 #include "hw/misc/mifare_mcm.h"
 #include "hw/misc/push_button.h"
+#include "hw/misc/ntc_thermistor.h"
 #include "hw/misc/turnstile.h"
 #include "hw/char/sc28c94.h"
 #include "hw/h8300/h83003_onchip.h"
@@ -136,6 +137,23 @@ enum {
  * switches OFF, the normal setting.
  */
 #define E2300_DRIVER_BUTTON 0x02     /* P8.1, low while pressed */
+
+/*
+ * On-board temperature sensor, read by the OS gettemp() (0xB9EA) for the
+ * application log.  It converts AN5 once and turns the result into a
+ * resistance as if the input were a divider with 100 kohm to AVref,
+ * R = 100000 * ADDR / (65536 - ADDR), scales it by the calibration word
+ * at 0x6016 (written by cal_therm(), 0x2000 = 1.0) and looks it up in a
+ * 125-entry table at 0x19B9A, -40 to 84 degrees Celsius.  That table
+ * follows the beta model of an NTC to within 0.15%: R25 = 20.4 kohm,
+ * B = 3516 K.  gettemp() reports the first table entry at or below the
+ * reading, i.e. the temperature rounded up to a whole degree.  The board
+ * values of the divider are not known; these reproduce the OS readings.
+ */
+#define E2300_THERM_AN 5
+#define E2300_THERM_R25 20400       /* ohms at 25 degrees Celsius */
+#define E2300_THERM_BETA 3516       /* kelvin */
+#define E2300_THERM_RREF 100000     /* ohms, AN5 to AVref */
 
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
@@ -959,6 +977,20 @@ static void e2300_init(MachineState *machine)
                                                  "driver-button", "driver");
     qdev_connect_gpio_out(DEVICE(s->driver_button), 0,
                           qemu_allocate_irq(e2300_driver_button, s, 0));
+
+    /*
+     * Temperature sensor on AN5, /machine/thermistor.  "qom-set
+     * /machine/thermistor temperature 31500" sets 31.5 degrees Celsius
+     * (25 by default); -trace ntc_thermistor_update shows the A/D input.
+     * gettemp() is only right with a calibration word at 0x6016 (0x2000
+     * for these values, "E 16 2000" at the boot monitor): with a blank
+     * one (0xffff) 25 degrees read as -19.
+     */
+    ntc_thermistor_create_simple(OBJECT(machine), "thermistor", "board",
+                                 E2300_THERM_R25, E2300_THERM_BETA,
+                                 E2300_THERM_RREF,
+                                 qdev_get_gpio_in_named(onchip, "an",
+                                                        E2300_THERM_AN));
 
     /*
      * Proximity card reader.  Give it a card with

@@ -44,3 +44,4 @@ config H8300_E2300
     select RFM433
     select RENESAS_SCI
     select TURNSTILE
+    select NTC_THERMISTOR
