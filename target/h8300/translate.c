@@ -982,61 +982,63 @@ static bool trans_DAS(DisasContext *ctx, arg_DAS *a)
     return true;
 }
 
+/*
+ * MULXU/MULXS Rs,Rd: Rd (16 bit) = RdL * Rs (8 bit), or
+ * ERd (32 bit) = Rd * Rs (16 bit).  Rs is read before Rd is touched because
+ * it may be a half of the destination, as in MULXU.W E6,ER6, which the
+ * compiler's 32 bit multiply helper uses.
+ */
+static void h8300_mulx(arg_MULXU *a, bool sign)
+{
+    TCGv src = tcg_temp_new();
+    TCGv dst = tcg_temp_new();
+    TCGv rd;
+
+    h8300_reg_ld(a->sz, a->rs, src, sign);
+    rd = h8300_reg_ld(a->sz + 1, a->rd, dst, sign);
+    switch (a->sz) {
+    case SZ_B:
+        if (sign) {
+            tcg_gen_ext8s_i32(dst, rd);
+            tcg_gen_ext8s_i32(src, src);
+        } else {
+            tcg_gen_ext8u_i32(dst, rd);
+            tcg_gen_ext8u_i32(src, src);
+        }
+        break;
+    case SZ_W:
+        if (sign) {
+            tcg_gen_ext16s_i32(dst, rd);
+            tcg_gen_ext16s_i32(src, src);
+        } else {
+            tcg_gen_ext16u_i32(dst, rd);
+            tcg_gen_ext16u_i32(src, src);
+        }
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    tcg_gen_mul_i32(dst, dst, src);
+    if (sign) {
+        tcg_gen_mov_i32(cpu_ccr_n, dst);
+        tcg_gen_mov_i32(cpu_ccr_z, dst);
+    }
+    if (a->sz == SZ_W) {
+        tcg_gen_mov_i32(cpu_regs[a->rd & 7], dst);
+    } else {
+        h8300_reg_st(SZ_W, a->rd, dst);
+    }
+}
+
 static bool trans_MULXU(DisasContext *ctx, arg_MULXU *a)
 {
-    TCGv temp1, temp2, reg1, reg2;
-    temp1 = tcg_temp_new();
-    temp2 = tcg_temp_new();
-    reg1 = h8300_reg_ld(a->sz + 1, a->rd, temp1, false);
-    switch(a->sz) {
-    case SZ_B:
-        tcg_gen_ext8u_i32(reg1, reg1);
-        break;
-    case SZ_W:
-        tcg_gen_ext16u_i32(reg1, reg1);
-        break;
-    default:
-        g_assert_not_reached();
-    }
-    reg2 = h8300_reg_ld(a->sz, a->rs, temp2, false);
-    switch(a->sz) {
-    case SZ_B:
-        tcg_gen_ext8u_i32(reg1, reg1);
-        tcg_gen_ext8u_i32(reg2, reg2);
-        break;
-    case SZ_W:
-        tcg_gen_ext16u_i32(reg1, reg1);
-        tcg_gen_ext16u_i32(reg2, reg2);
-        break;
-    default:
-        g_assert_not_reached();
-    }
-    tcg_gen_mul_i32(reg1, reg1, reg2);
-    h8300_reg_st(a->sz + 1, a->rd, reg1);
+    h8300_mulx(a, false);
     return true;
 }
 
 static bool trans_MULXS(DisasContext *ctx, arg_MULXU *a)
 {
-    TCGv temp1, temp2, reg1, reg2;
-    temp1 = tcg_temp_new();
-    temp2 = tcg_temp_new();
-    reg1 = h8300_reg_ld(a->sz + 1, a->rd, temp1, true);
-    switch(a->sz) {
-    case SZ_B:
-        tcg_gen_ext8s_i32(reg1, reg1);
-        break;
-    case SZ_W:
-        tcg_gen_ext16s_i32(reg1, reg1);
-        break;
-    default:
-        g_assert_not_reached();
-    }
-    reg2 = h8300_reg_ld(a->sz, a->rs, temp2, true);
-    tcg_gen_mul_i32(reg1, reg1, reg2);
-    tcg_gen_mov_i32(cpu_ccr_n, reg1);
-    tcg_gen_mov_i32(cpu_ccr_z, reg1);
-    h8300_reg_st(a->sz + 1, a->rd, reg1);
+    h8300_mulx(a, true);
     return true;
 }
 
