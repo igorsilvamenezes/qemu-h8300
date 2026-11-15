@@ -23,6 +23,8 @@
 #include "hw/misc/mifare_mcm.h"
 #include "hw/char/sc28c94.h"
 #include "hw/h8300/h83003_onchip.h"
+#include "hw/i2c/bitbang_i2c.h"
+#include "hw/i2c/i2c.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/qdev-properties.h"
@@ -51,6 +53,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
 #define E2300_DISPLAY_BASE 0x800000  /* CS4: HDSP-211x, FL on A5 */
 #define E2300_MIFARE_BASE 0x810010   /* CS4: MIFARE Core Module */
 #define E2300_QUART_BASE 0x810080    /* CS4: SC28C94 quad UART on IRQ0 */
+#define E2300_I2C_SCL 0x80           /* PB7, open drain through PBDDR */
+#define E2300_I2C_SDA 0x04           /* PB2, open drain through PBDDR */
+#define E2300_RTC_ADDR 0x68          /* DS1307-compatible clock, 0xD0/0xD1 */
 
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
@@ -77,6 +82,11 @@ struct E2300MachineState {
     uint8_t flash_status;
     hwaddr flash_dirty_start, flash_dirty_end;
     uint8_t port[H83003_GPIO_SIZE];
+    I2CBus *i2c_bus;
+    bitbang_i2c_interface i2c;
+    bool i2c_scl;           /* levels driven by the CPU */
+    bool i2c_sda;
+    bool i2c_sda_line;      /* SDA as seen on the wire, with the slave */
     uint8_t syscr;
     bool autoboot;
     QEMUTimer *wdt_timer;
@@ -235,10 +245,35 @@ static int port_ddr_of(hwaddr reg)
     }
 }
 
+/*
+ * The real-time clock hangs on a bit-banged I2C bus: PB7 is SCL and PB2 is
+ * SDA, both pulled up and driven low by setting the PBDDR bit with the
+ * PBDR bit at 0.
+ */
+static void e2300_i2c_update(E2300MachineState *s)
+{
+    uint8_t ddr = s->port[PORT_REG(0xffffd4)];
+    uint8_t dr = s->port[PORT_REG(0xffffd6)];
+    bool scl = !(ddr & E2300_I2C_SCL) || (dr & E2300_I2C_SCL);
+    bool sda = !(ddr & E2300_I2C_SDA) || (dr & E2300_I2C_SDA);
+
+    if (scl != s->i2c_scl) {
+        s->i2c_scl = scl;
+        s->i2c_sda_line = bitbang_i2c_set(&s->i2c, BITBANG_I2C_SCL, scl);
+    }
+    if (sda != s->i2c_sda) {
+        s->i2c_sda = sda;
+        s->i2c_sda_line = bitbang_i2c_set(&s->i2c, BITBANG_I2C_SDA, sda);
+    }
+}
+
 /* Level of the pins configured as inputs. */
 static uint8_t port_pins(E2300MachineState *s, hwaddr reg)
 {
     switch (reg) {
+    case 0xffffd6: /* PBDR bits 7 and 2, I2C clock and data */
+        return ~((s->i2c_scl ? 0 : E2300_I2C_SCL) |
+                 (s->i2c_sda_line ? 0 : E2300_I2C_SDA));
     case 0xffffcf: /* P8DR bits 1-3, IC2 boot mode switches */
         return s->autoboot ? 0x02 : 0;
     case 0xffffd7: /* PCDR bit 4, IC2 boot mode switch */
@@ -277,6 +312,7 @@ static void gpio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     /* Port B writes are traced with the PC of the writing instruction. */
     if (reg == 0xffffd4 || reg == 0xffffd6) {
         trace_h83003_portb_write(s->cpu.env.pc, reg, val, size);
+        e2300_i2c_update(s);
     }
 }
 
@@ -426,6 +462,9 @@ static void e2300_reset(MachineState *machine, ShutdownCause reason)
     const uint8_t *data = memory_region_get_ram_ptr(&s->flash);
 
     memset(s->port, 0, sizeof(s->port));
+    bitbang_i2c_init(&s->i2c, s->i2c_bus);
+    s->i2c.state = STOPPED;
+    s->i2c_scl = s->i2c_sda = s->i2c_sda_line = true;
     s->syscr = 0x0b;
     memory_region_set_enabled(&s->iram, true);
     s->flash_status = 0x80;
@@ -543,6 +582,12 @@ static void e2300_init(MachineState *machine)
     qdev_prop_set_uint64(onchip, "clock-frequency", E2300_CLOCK_HZ);
     sysbus_realize(SYS_BUS_DEVICE(onchip), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(onchip), 0, H83003_ONCHIP_BASE, -1);
+
+    /* DS1307-compatible real-time clock on the bit-banged I2C bus. */
+    s->i2c_bus = i2c_init_bus(onchip, "i2c");
+    bitbang_i2c_init(&s->i2c, s->i2c_bus);
+    s->i2c_scl = s->i2c_sda = s->i2c_sda_line = true;
+    i2c_slave_create_simple(s->i2c_bus, "ds1338", E2300_RTC_ADDR);
 
     /*
      * Front panel display.  Its text can be logged with

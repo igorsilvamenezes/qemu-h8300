@@ -31,6 +31,8 @@ config H8300_EDOSK2674
 config H8300_E2300
     bool
     select H8300
+    select BITBANG_I2C
+    select DS1338
     select HDSP211X
     select MIFARE_MCM
     select SC28C94
