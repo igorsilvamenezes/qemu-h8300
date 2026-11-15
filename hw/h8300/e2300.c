@@ -21,6 +21,7 @@
 #include "hw/char/renesas_sci.h"
 #include "hw/char/rfm433.h"
 #include "hw/display/hdsp211x.h"
+#include "hw/misc/dip_switch.h"
 #include "hw/misc/gpio_beeper.h"
 #include "hw/misc/led.h"
 #include "hw/misc/mifare_mcm.h"
@@ -37,6 +38,7 @@
 #include "sysemu/runstate.h"
 #include "sysemu/sysemu.h"
 #include "trace/trace-system.h"
+#include "trace.h"
 
 #define TYPE_E2300_MACHINE MACHINE_TYPE_NAME("e2300")
 OBJECT_DECLARE_SIMPLE_TYPE(E2300MachineState, E2300_MACHINE)
@@ -73,6 +75,25 @@ enum {
     E2300_PANEL_LINES
 };
 
+/*
+ * IC2, four DIP switches read by the boot monitor (ini_hw) and by the OS
+ * readpa() ("read polling address").  A switch that is ON pulls its pin
+ * low; readpa() returns the inverted pins, so switch n adds 1 << (n - 1):
+ *
+ *   switch 1: PCDR bit 4    readpa  1  application debug output (printd)
+ *   switch 2: P8DR bit 1            2
+ *   switch 3: P8DR bit 2            4
+ *   switch 4: P8DR bit 3            8  application test menu on SCI1
+ *
+ * All ON (15) keeps the boot monitor at its '>' prompt for SENDBIN; any
+ * other value lets it start the OS.  The numbering of the switches on the
+ * part is inferred from readpa(); the board schematic is not available.
+ * (Older boards, OS hardware variant < 4, read the same switches on
+ * P5DR bits 4-7; the OS identifies this board as variant 4.)
+ */
+#define E2300_IC2_SWITCHES 4
+#define E2300_IC2_ALL_ON 0xf
+
 /* Byte-wide Intel 28F002 bottom-boot flash. */
 enum E2300FlashMode {
     FLASH_ARRAY, FLASH_ID, FLASH_STATUS, FLASH_PROGRAM, FLASH_ERASE,
@@ -108,6 +129,9 @@ struct E2300MachineState {
     uint8_t syscr;
     bool autoboot;
     bool radio;
+    char *switches;         /* "switches" machine property */
+    DIPSwitchState *ic2;
+    int ic2_traced;         /* positions last reported, -1 for none */
     QEMUTimer *wdt_timer;
     int64_t wdt_start;
     uint8_t tcsr, tcnt, rstcsr;
@@ -308,13 +332,49 @@ static uint8_t port_pins(E2300MachineState *s, hwaddr reg)
     case 0xffffd6: /* PBDR bits 7 and 2, I2C clock and data */
         return ~((s->i2c_scl ? 0 : E2300_I2C_SCL) |
                  (s->i2c_sda_line ? 0 : E2300_I2C_SDA));
-    case 0xffffcf: /* P8DR bits 1-3, IC2 boot mode switches */
-        return s->autoboot ? 0x02 : 0;
-    case 0xffffd7: /* PCDR bit 4, IC2 boot mode switch */
-        return s->autoboot ? 0x10 : 0;
+    case 0xffffcf: /* P8DR bits 1-3, IC2 switches 2-4 */
+        return ~dip_switch_get(s->ic2) & 0xe;
+    case 0xffffd7: /* PCDR bit 4, IC2 switch 1 */
+        return (~dip_switch_get(s->ic2) & 0x1) << 4;
     default:       /* undriven inputs are pulled up */
         return 0xff;
     }
+}
+
+static const char *e2300_switch_mode(uint32_t positions)
+{
+    switch (positions) {
+    case E2300_IC2_ALL_ON:
+        return "boot monitor (SENDBIN)";
+    case 0:
+        return "normal";
+    case 1:
+        return "normal, application debug output";
+    case 8:
+        return "application test menu on SCI1";
+    default:
+        return "normal (polling address only)";
+    }
+}
+
+/* Report the IC2 positions and what the firmware makes of them. */
+static void e2300_switches_trace(E2300MachineState *s)
+{
+    uint32_t positions = dip_switch_get(s->ic2);
+    g_autofree char *text = NULL;
+
+    if (s->ic2_traced == positions) {
+        return;
+    }
+    s->ic2_traced = positions;
+    text = dip_switch_format(positions, E2300_IC2_SWITCHES);
+    trace_e2300_switches(text, positions, e2300_switch_mode(positions));
+}
+
+/* An IC2 output changed; the pins are read from the bank directly. */
+static void e2300_switch_changed(void *opaque, int n, int level)
+{
+    e2300_switches_trace(opaque);
 }
 
 static uint64_t gpio_read(void *opaque, hwaddr addr, unsigned size)
@@ -574,6 +634,58 @@ static void e2300_init_sci(E2300MachineState *s, RSCIState *sci,
     }
 }
 
+/* Translate the "switches" presets into dip-switch positions. */
+static const char *e2300_switch_preset(const char *name)
+{
+    static const struct {
+        const char *name, *positions;
+    } presets[] = {
+        { "monitor", "0xf" },
+        { "normal", "0" },
+        { "test", "8" },
+        { "debug", "1" },
+    };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(presets); i++) {
+        if (!g_ascii_strcasecmp(name, presets[i].name)) {
+            return presets[i].positions;
+        }
+    }
+    return name;
+}
+
+static void e2300_init_switches(E2300MachineState *s)
+{
+    DeviceState *dev = qdev_new(TYPE_DIP_SWITCH);
+    const char *positions = NULL;
+    qemu_irq *in;
+    int i;
+
+    qdev_prop_set_uint32(dev, "num-switches", E2300_IC2_SWITCHES);
+    qdev_prop_set_string(dev, "label", "IC2");
+    /* -global dip-switch.positions=... works too when "switches" is unset. */
+    if (s->switches) {
+        positions = e2300_switch_preset(s->switches);
+    } else if (!DIP_SWITCH(dev)->pending) {
+        positions = s->autoboot ? "normal" : "monitor";
+        positions = e2300_switch_preset(positions);
+    }
+    if (positions) {
+        object_property_set_str(OBJECT(dev), "positions", positions,
+                                &error_fatal);
+    }
+    object_property_add_child(OBJECT(s), "ic2", OBJECT(dev));
+    qdev_realize_and_unref(dev, NULL, &error_fatal);
+    s->ic2 = DIP_SWITCH(dev);
+
+    in = qemu_allocate_irqs(e2300_switch_changed, s, E2300_IC2_SWITCHES);
+    for (i = 0; i < E2300_IC2_SWITCHES; i++) {
+        qdev_connect_gpio_out_named(dev, "switch", i, in[i]);
+    }
+    e2300_switches_trace(s);
+}
+
 static void e2300_init(MachineState *machine)
 {
     E2300MachineState *s = E2300_MACHINE(machine);
@@ -638,6 +750,16 @@ static void e2300_init(MachineState *machine)
                             TYPE_HDSP211X);
     sysbus_realize(SYS_BUS_DEVICE(&s->display), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->display), 0, E2300_DISPLAY_BASE);
+
+    /*
+     * IC2 boot and mode switches.  Set them with switches=<positions>,
+     * where <positions> is monitor, normal, test, debug, a list such as
+     * on:off:off:on (switch 1 first) or a number such as 8; without it,
+     * autoboot=on means all OFF and autoboot=off all ON.  "qom-set /machine
+     * switches test" or "qom-set /machine/ic2 positions 0x8" moves them at
+     * run time; -trace e2300_switches (or dip_switch_set) reports them.
+     */
+    e2300_init_switches(s);
 
     /*
      * Front panel lamps on port 4, one device each so that they show up
@@ -715,6 +837,30 @@ static void e2300_set_autoboot(Object *obj, bool enabled, Error **errp)
     E2300_MACHINE(obj)->autoboot = enabled;
 }
 
+static char *e2300_get_switches(Object *obj, Error **errp)
+{
+    E2300MachineState *s = E2300_MACHINE(obj);
+
+    if (s->ic2) {
+        return dip_switch_format(dip_switch_get(s->ic2), E2300_IC2_SWITCHES);
+    }
+    return g_strdup(s->switches ? s->switches : "");
+}
+
+static void e2300_set_switches(Object *obj, const char *value, Error **errp)
+{
+    E2300MachineState *s = E2300_MACHINE(obj);
+
+    if (s->ic2) {
+        /* At run time, move the switches of the existing bank. */
+        object_property_set_str(OBJECT(s->ic2), "positions",
+                                e2300_switch_preset(value), errp);
+        return;
+    }
+    g_free(s->switches);
+    s->switches = g_strdup(value);
+}
+
 static bool e2300_get_radio(Object *obj, Error **errp)
 {
     return E2300_MACHINE(obj)->radio;
@@ -728,6 +874,12 @@ static void e2300_set_radio(Object *obj, bool enabled, Error **errp)
 static void e2300_instance_init(Object *obj)
 {
     E2300_MACHINE(obj)->radio = true;
+    E2300_MACHINE(obj)->ic2_traced = -1;
+}
+
+static void e2300_instance_finalize(Object *obj)
+{
+    g_free(E2300_MACHINE(obj)->switches);
 }
 
 static void e2300_class_init(ObjectClass *oc, void *data)
@@ -744,7 +896,13 @@ static void e2300_class_init(ObjectClass *oc, void *data)
     object_class_property_add_bool(oc, "autoboot",
                                    e2300_get_autoboot, e2300_set_autoboot);
     object_class_property_set_description(oc, "autoboot",
-                                          "Set boot switches for OS startup");
+        "IC2 switches all OFF (OS startup) when no 'switches' is given; "
+        "default all ON (boot monitor)");
+    object_class_property_add_str(oc, "switches",
+                                  e2300_get_switches, e2300_set_switches);
+    object_class_property_set_description(oc, "switches",
+        "IC2 DIP switches: monitor, normal, test, debug, a list such as "
+        "on:off:off:on (switch 1 first) or a bit mask such as 8");
     object_class_property_add_bool(oc, "radio",
                                    e2300_get_radio, e2300_set_radio);
     object_class_property_set_description(oc, "radio",
@@ -756,6 +914,7 @@ static const TypeInfo e2300_type = {
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(E2300MachineState),
     .instance_init = e2300_instance_init,
+    .instance_finalize = e2300_instance_finalize,
     .class_init = e2300_class_init,
 };
 

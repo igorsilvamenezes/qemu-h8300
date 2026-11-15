@@ -3299,6 +3299,7 @@ if have_system
     'hw/char',
     'hw/display',
     'hw/dma',
+    'hw/h8300',
     'hw/hyperv',
     'hw/i2c',
     'hw/i386',

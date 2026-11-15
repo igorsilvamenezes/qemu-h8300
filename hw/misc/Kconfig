@@ -143,6 +143,9 @@ config UNIMP
 config LED
     bool
 
+config DIP_SWITCH
+    bool
+
 config GPIO_BEEPER
     bool
 

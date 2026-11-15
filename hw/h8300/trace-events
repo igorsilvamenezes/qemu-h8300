@@ -1,0 +1,4 @@
+# See docs/devel/tracing.rst for syntax documentation.
+
+# e2300.c
+e2300_switches(const char *positions, unsigned value, const char *mode) "IC2 %s readpa=%u: %s"

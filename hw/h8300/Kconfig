@@ -32,6 +32,7 @@ config H8300_E2300
     bool
     select H8300
     select BITBANG_I2C
+    select DIP_SWITCH
     select DS1338
     select GPIO_BEEPER
     select HDSP211X
