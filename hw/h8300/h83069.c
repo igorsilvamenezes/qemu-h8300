@@ -29,7 +29,7 @@
 
 struct H83069Class {
     /*< private >*/
-    DeviceClass parent_class;
+    SysBusDeviceClass parent_class; /* Match the MCU parent type. */
     /*< public >*/
 };
 typedef struct H83069Class H83069Class;
@@ -89,7 +89,6 @@ static void register_tmr(H83069State *s, int unit)
 
     tmr = SYS_BUS_DEVICE(&s->tmr[unit]);
     qdev_prop_set_uint64(DEVICE(tmr), "input-freq", s->input_freq);
-    qdev_prop_set_uint32(DEVICE(tmr), "timer-type", 1);
     sysbus_realize(tmr, &error_abort);
 
     irqbase = H83069_TMR_IRQBASE + TMR_NR_IRQ * unit;
@@ -179,7 +178,7 @@ static void h83069_class_init(ObjectClass *klass, void *data)
 
 static const TypeInfo h83069_info = {
     .name = TYPE_H83069,
-    .parent = TYPE_DEVICE,
+    .parent = TYPE_SYS_BUS_DEVICE, /* Match the MMIO registration in realize. */
     .instance_size = sizeof(H83069State),
     .class_init = h83069_class_init,
     .class_size = sizeof(H83069Class),

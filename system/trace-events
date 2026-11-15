@@ -38,3 +38,6 @@ dirtylimit_state_finalize(void)
 dirtylimit_throttle_pct(int cpu_index, uint64_t pct, int64_t time_us) "CPU[%d] throttle percent: %" PRIu64 ", throttle adjust time %"PRIi64 " us"
 dirtylimit_set_vcpu(int cpu_index, uint64_t quota) "CPU[%d] set dirty page rate limit %"PRIu64
 dirtylimit_vcpu_execute(int cpu_index, int64_t sleep_time_us) "CPU[%d] sleep %"PRIi64 " us"
+
+# hw/h8300/kanebebe.c
+h83003_portb_write(uint32_t pc, uint64_t addr, uint64_t value, unsigned size) "pc=0x%08"PRIx32" addr 0x%"PRIx64" value 0x%"PRIx64" size %u"
